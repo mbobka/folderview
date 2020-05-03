@@ -46,3 +46,7 @@ using namespace Microsoft::WRL;
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+
+#include <iostream>
+#include <filesystem>
+#include <string>

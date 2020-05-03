@@ -1,18 +1,12 @@
 // experiment.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
-#include <iostream>
-#include <filesystem>
-#include <string>
-#include <boost/locale.hpp>
-using namespace boost::locale;
+#include <Windows.h>
 
 using namespace std;
 using namespace std::filesystem;
 
 
-generator gen;
-std::locale loc = gen("");
 vector<wstring> extensions{ L".jpg", L".jpeg" };
 
 void search_inside_directory(vector<path>& folders, vector<path>& files, path root) {
@@ -23,7 +17,7 @@ void search_inside_directory(vector<path>& folders, vector<path>& files, path ro
 		}
 		else {
 			if (entry.is_regular_file()) {
-				if (std::find_if(extensions.begin(), extensions.end(), [&entry](wstring& ext) {return 0 == use_facet<collator<wchar_t>>(loc).compare(collator_base::primary, ext, entry.path().extension()); }) != extensions.end())
+				if (std::find_if(extensions.begin(), extensions.end(), [&entry](wstring& ext) {return 0 == lstrcmpi(ext.c_str(), entry.path().extension().c_str()); }) != extensions.end())
 					files.push_back(entry.path());
 			}
 		}
@@ -32,9 +26,8 @@ void search_inside_directory(vector<path>& folders, vector<path>& files, path ro
 
 int main()
 {
-	std::locale::global(loc);
-
-	auto root = path("D:") / "--- Met-Art.Unpacked ---";
+	auto root = path("\\\\server\\d$\\--- Archive ---\\Matsuura Aya - 2009 - Concert Tour 2009 Aki ~Omoi Afurete~ Visual Book");
+//	auto root = path("D:") / "--- Met-Art.Unpacked ---";
 	auto folders = vector<path>();
 	auto files = vector<path>();
 
