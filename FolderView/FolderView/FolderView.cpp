@@ -1,225 +1,125 @@
-// FolderView.cpp : Defines the entry point for the application.
-//
-
 #include "framework.h"
-#include "FolderView.h"
 
-// The number of swap chain back buffers.
-const uint8_t g_NumFrames = 3;
-// Use WARP adapter
-bool g_UseWarp = false;
+std::unique_ptr<Bitmap> image;
+std::unique_ptr<CachedBitmap> cache;
 
-uint32_t g_ClientWidth = 1280;
-uint32_t g_ClientHeight = 720;
-
-// Set to true once the DX12 objects have been initialized.
-bool g_IsInitialized = false;
-
-// DirectX 12 Objects
-ComPtr<ID3D12Device2> g_Device;
-ComPtr<ID3D12CommandQueue> g_CommandQueue;
-ComPtr<IDXGISwapChain4> g_SwapChain;
-ComPtr<ID3D12Resource> g_BackBuffers[g_NumFrames];
-ComPtr<ID3D12GraphicsCommandList> g_CommandList;
-ComPtr<ID3D12CommandAllocator> g_CommandAllocators[g_NumFrames];
-ComPtr<ID3D12DescriptorHeap> g_RTVDescriptorHeap;
-
-UINT g_RTVDescriptorSize;
-UINT g_CurrentBackBufferIndex;
-
-// Synchronization objects
-ComPtr<ID3D12Fence> g_Fence;
-uint64_t g_FenceValue = 0;
-uint64_t g_FrameFenceValues[g_NumFrames] = {};
-HANDLE g_FenceEvent;
-
-// By default, enable V-Sync.
-// Can be toggled with the V key.
-bool g_VSync = true;
-bool g_TearingSupported = false;
-// By default, use windowed mode.
-// Can be toggled with the Alt+Enter or F11
-bool g_Fullscreen = false;
-
-inline void ThrowIfFailed(HRESULT hr)
+VOID OnPaint(HDC hdc)
 {
-    if (FAILED(hr))
-    {
-        throw std::exception();
-    }
-}
+	Graphics graphics(hdc);
 
-const int MAX_LOADSTRING = 100;
+	if (!cache)
+		cache.reset(new CachedBitmap(image.get(), &graphics));
 
-// Global Variables:
-HINSTANCE hInst;                                // current instance
-WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
-WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
-
-// Forward declarations of functions included in this code module:
-ATOM                MyRegisterClass(HINSTANCE hInstance);
-BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
-
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-                     _In_opt_ HINSTANCE hPrevInstance,
-                     _In_ LPWSTR    lpCmdLine,
-                     _In_ int       nCmdShow)
-{
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
-
-    // TODO: Place code here.
-
-    // Initialize global strings
-    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_FOLDERVIEW, szWindowClass, MAX_LOADSTRING);
-    MyRegisterClass(hInstance);
-
-    // Perform application initialization:
-    if (!InitInstance (hInstance, nCmdShow))
-    {
-        return FALSE;
-    }
-
-    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_FOLDERVIEW));
-
-    MSG msg;
-
-    // Main message loop:
-    while (GetMessage(&msg, nullptr, 0, 0))
-    {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
-        {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-    }
-
-    return (int) msg.wParam;
+	graphics.DrawCachedBitmap(cache.get(), 0, 0);
 }
 
 
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
-//
-//  FUNCTION: MyRegisterClass()
-//
-//  PURPOSE: Registers the window class.
-//
-ATOM MyRegisterClass(HINSTANCE hInstance)
+std::vector<std::filesystem::path> files;
+
+INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
-    WNDCLASSEXW wcex;
+	HWND                hWnd;
+	MSG                 msg;
+	GdiplusStartupInput gdiplusStartupInput;
+	ULONG_PTR           gdiplusToken;
 
-    wcex.cbSize = sizeof(WNDCLASSEX);
+	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    wcex.style          = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc    = WndProc;
-    wcex.cbClsExtra     = 0;
-    wcex.cbWndExtra     = 0;
-    wcex.hInstance      = hInstance;
-    wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_FOLDERVIEW));
-    wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
-    wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_FOLDERVIEW);
-    wcex.lpszClassName  = szWindowClass;
-    wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
+	// Initialize GDI+.
+	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
-    return RegisterClassExW(&wcex);
-}
+	for (auto entry : std::filesystem::directory_iterator(std::filesystem::path(L"\\\\server\\d$\\--- Archive ---\\Matsuura Aya - 2009 - Concert Tour 2009 Aki ~Omoi Afurete~ Visual Book")))
+	{
+		if (!entry.is_regular_file())
+			continue;
 
-//
-//   FUNCTION: InitInstance(HINSTANCE, int)
-//
-//   PURPOSE: Saves instance handle and creates main window
-//
-//   COMMENTS:
-//
-//        In this function, we save the instance handle in a global variable and
-//        create and display the main program window.
-//
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+		if (lstrcmpi(entry.path().extension().c_str(), L".jpg") != 0)
+			continue;
+
+		files.push_back(entry.path());
+	}
+
+
+	WNDCLASSEXW wndClass;
+	wndClass.cbSize = sizeof(wndClass);
+	wndClass.style = CS_HREDRAW | CS_VREDRAW;
+	wndClass.lpfnWndProc = WndProc;
+	wndClass.cbClsExtra = 0;
+	wndClass.cbWndExtra = 0;
+	wndClass.hInstance = hInstance;
+	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wndClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+	wndClass.lpszMenuName = nullptr;
+	wndClass.lpszClassName = TEXT("FolderView");
+	wndClass.hIconSm = nullptr;
+
+	RegisterClassEx(&wndClass);
+
+	hWnd = CreateWindow(
+		wndClass.lpszClassName,   // window class name
+		TEXT("Getting Started"),  // window caption
+		WS_OVERLAPPEDWINDOW,      // window style
+		CW_USEDEFAULT,            // initial x position
+		CW_USEDEFAULT,            // initial y position
+		CW_USEDEFAULT,            // initial x size
+		CW_USEDEFAULT,            // initial y size
+		NULL,                     // parent window handle
+		NULL,                     // window menu handle
+		hInstance,                // program instance handle
+		NULL);                    // creation parameters
+
+
+	ShowWindow(hWnd, iCmdShow);
+	UpdateWindow(hWnd);
+
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	image.reset();
+	cache.reset();
+
+	GdiplusShutdown(gdiplusToken);
+	return msg.wParam;
+}  // WinMain
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message,
+	WPARAM wParam, LPARAM lParam)
 {
-   hInst = hInstance; // Store instance handle in our global variable
+	HDC          hdc;
+	PAINTSTRUCT  ps;
 
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+	switch (message)
+	{
+	case WM_CREATE: {
+		image.reset(Bitmap::FromFile(files[1].c_str()));
 
-   if (!hWnd)
-   {
-      return FALSE;
-   }
+		SizeF bounds;
+		image->GetPhysicalDimension(&bounds);
 
-   ShowWindow(hWnd, nCmdShow);
-   UpdateWindow(hWnd);
+		UINT dpi = GetDpiForWindow(hWnd);
 
-   return TRUE;
-}
+		RECT rect{ 0,0, bounds.Width, bounds.Height };
 
-//
-//  FUNCTION: WndProc(HWND, UINT, WPARAM, LPARAM)
-//
-//  PURPOSE: Processes messages for the main window.
-//
-//  WM_COMMAND  - process the application menu
-//  WM_PAINT    - Paint the main window
-//  WM_DESTROY  - post a quit message and return
-//
-//
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message)
-    {
-    case WM_COMMAND:
-        {
-            int wmId = LOWORD(wParam);
-            // Parse the menu selections:
-            switch (wmId)
-            {
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-                break;
-            case IDM_EXIT:
-                DestroyWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
-            }
-        }
-        break;
-    case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            // TODO: Add any drawing code that uses hdc here...
-            EndPaint(hWnd, &ps);
-        }
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        break;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-    return 0;
-}
+		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+		return 0; 
+	}
 
-// Message handler for about box.
-INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    UNREFERENCED_PARAMETER(lParam);
-    switch (message)
-    {
-    case WM_INITDIALOG:
-        return (INT_PTR)TRUE;
-
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
-        {
-            EndDialog(hDlg, LOWORD(wParam));
-            return (INT_PTR)TRUE;
-        }
-        break;
-    }
-    return (INT_PTR)FALSE;
-}
+	case WM_PAINT:
+		hdc = BeginPaint(hWnd, &ps);
+		OnPaint(hdc);
+		EndPaint(hWnd, &ps);
+		return 0;
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 0;
+	default:
+		return DefWindowProc(hWnd, message, wParam, lParam);
+	}
+} // WndProc
