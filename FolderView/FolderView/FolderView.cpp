@@ -67,7 +67,8 @@ void BuildExtensionsList()
 	free(decoders);
 }
 
-void UpdateWindowContent(HWND hWnd) {
+void UpdateWindowContent(HWND hWnd) 
+{
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
 	cache.reset();
 
