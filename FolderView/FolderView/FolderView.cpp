@@ -1,4 +1,5 @@
 #include "framework.h"
+#include <sstream>
 
 std::unique_ptr<Bitmap> image;
 std::unique_ptr<CachedBitmap> cache;
@@ -15,7 +16,11 @@ VOID OnPaint(HDC hdc)
 
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+void BuildExtensionsList();
 
+void BuildFilesList();
+
+std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
@@ -30,17 +35,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	// Initialize GDI+.
 	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
-	for (auto entry : std::filesystem::directory_iterator(std::filesystem::path(L"\\\\server\\d$\\--- Archive ---\\Matsuura Aya - 2009 - Concert Tour 2009 Aki ~Omoi Afurete~ Visual Book")))
-	{
-		if (!entry.is_regular_file())
-			continue;
-
-		if (lstrcmpi(entry.path().extension().c_str(), L".jpg") != 0)
-			continue;
-
-		files.push_back(entry.path());
-	}
-
+	BuildExtensionsList();
+	BuildFilesList();
 
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
@@ -88,8 +84,49 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	return msg.wParam;
 }  // WinMain
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message,
-	WPARAM wParam, LPARAM lParam)
+bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
+	for (auto extension : extensions) {
+		if (lstrcmpi(file.extension().c_str(), L".jpg") == 0)
+			return true;
+	}
+
+	return false;
+}
+
+void BuildFilesList()
+{
+	for (auto entry : std::filesystem::directory_iterator(std::filesystem::path(L"\\\\server\\d$\\--- Archive ---\\Matsuura Aya - 2009 - Concert Tour 2009 Aki ~Omoi Afurete~ Visual Book")))
+	{
+		if (!entry.is_regular_file())
+			continue;
+
+		if (!is_file_has_right_extension_for_us(entry.path()))
+			continue;
+
+		files.push_back(entry.path());
+	}
+}
+
+void BuildExtensionsList()
+{
+	UINT decoders_count, decoders_size;
+	Gdiplus::GetImageDecodersSize(&decoders_count, &decoders_size);
+
+	auto decoders = reinterpret_cast<ImageCodecInfo*>(malloc(decoders_size));
+	Gdiplus::GetImageDecoders(decoders_count, decoders_size, decoders);
+
+	for (int i = 0; i < decoders_count; i++) {
+		std::wistringstream f(decoders[i].FilenameExtension);
+		std::wstring s;
+		while (std::getline(f, s, L';')) {
+			extensions.push_back(s.c_str() + 1);
+		}
+	}
+
+	free(decoders);
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	HDC          hdc;
 	PAINTSTRUCT  ps;
@@ -102,13 +139,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message,
 		SizeF bounds;
 		image->GetPhysicalDimension(&bounds);
 
-		UINT dpi = GetDpiForWindow(hWnd);
-
 		RECT rect{ 0,0, bounds.Width, bounds.Height };
-
 		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
-		return 0; 
+		
+		return 0;
 	}
 
 	case WM_PAINT:
