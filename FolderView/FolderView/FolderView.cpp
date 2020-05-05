@@ -19,6 +19,8 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void BuildExtensionsList();
 void UpdateWindowContent(HWND hWnd);
 void BuildFilesList();
+void PreviousImage(HWND hWnd);
+void NextImage(HWND hWnd);
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
@@ -146,25 +148,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	switch (message)
 	{
-	case WM_CREATE: {
+	case WM_CREATE:
 		UpdateWindowContent(hWnd);
 		return 0;
+
+	case WM_MOUSEWHEEL: {
+		auto fwKeys = GET_KEYSTATE_WPARAM(wParam);
+		auto zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+
+		if (zDelta > 0) {
+			PreviousImage(hWnd);
+		}
+		else if (zDelta < 0) {
+			NextImage(hWnd);
+		}
+
+		return 0;
 	}
+
 	case WM_KEYDOWN: {
 		auto vkey = static_cast<UINT8>(wParam);
 
 		switch (vkey) {
 		case VK_NUMPAD8:
 		case VK_UP:
-			current_image--;
-			if (current_image < 0) {
-				MessageBeep(MB_ICONWARNING);
-				current_image = 0;
-				return 0;
-			}
-
-			UpdateWindowContent(hWnd);
-			InvalidateRect(hWnd, NULL, TRUE);
+			PreviousImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD7:
@@ -187,15 +195,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		case VK_NUMPAD2:
 		case VK_DOWN:
-			current_image++;
-			if (current_image >= files.size()) {
-				MessageBeep(MB_ICONWARNING);
-				current_image = files.size() - 1;
-				return 0;
-			}
-
-			UpdateWindowContent(hWnd);
-			InvalidateRect(hWnd, NULL, TRUE);
+			NextImage(hWnd);
 			return 0;
 		}
 
@@ -207,6 +207,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		OnPaint(hdc);
 		EndPaint(hWnd, &ps);
 		return 0;
+
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
@@ -214,3 +215,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
+
+void PreviousImage(HWND hWnd)
+{
+	current_image--;
+	if (current_image < 0) {
+		MessageBeep(MB_ICONWARNING);
+		current_image = 0;
+		return;
+	}
+
+	UpdateWindowContent(hWnd);
+	InvalidateRect(hWnd, NULL, TRUE);
+}
+
+void NextImage(HWND hWnd)
+{
+	current_image++;
+	if (current_image >= files.size()) {
+		MessageBeep(MB_ICONWARNING);
+		current_image = files.size() - 1;
+		return;
+	}
+
+	UpdateWindowContent(hWnd);
+	InvalidateRect(hWnd, NULL, TRUE);
+}
