@@ -2,11 +2,10 @@
 
 void BuildExtensionsList();
 void UpdateWindowContent(HWND hWnd);
-void BuildFilesList();
+void BuildFilesList(std::filesystem::path const& file_or_folder);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
 void DrawCurrentImage(HWND hWnd);
-
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
@@ -34,17 +33,36 @@ bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	return false;
 }
 
-void BuildFilesList()
+void BuildFilesList(std::filesystem::path const& file_or_folder)
 {
-	for (auto entry : std::filesystem::directory_iterator(std::filesystem::path(L"\\\\server\\d$\\--- Archive ---\\Matsuura Aya - 2009 - Concert Tour 2009 Aki ~Omoi Afurete~ Visual Book")))
+	std::filesystem::directory_entry entry(file_or_folder);
+	if (!entry.exists()) {
+		MessageBox(NULL, L"ѕуть не найден", L"Folder view", MB_OK | MB_ICONERROR);
+		return;
+	}
+
+	std::filesystem::path files_root;
+
+	if (entry.is_directory()) {
+		files_root = entry.path();
+	}
+
+	if (entry.is_regular_file()) {
+		files_root = entry.path().lexically_normal().parent_path();
+	}
+
+	for (auto entryx : std::filesystem::directory_iterator(files_root))
 	{
-		if (!entry.is_regular_file())
+		if (!entryx.is_regular_file())
 			continue;
 
-		if (!is_file_has_right_extension_for_us(entry.path()))
+		if (!is_file_has_right_extension_for_us(entryx.path()))
 			continue;
 
-		files.push_back(entry.path());
+		if (entry.path().lexically_normal() == entryx.path().lexically_normal())
+			current_image = files.size();
+
+		files.push_back(entryx.path());
 	}
 }
 
@@ -67,14 +85,15 @@ void BuildExtensionsList()
 	free(decoders);
 }
 
-void UpdateWindowContent(HWND hWnd) {
+void UpdateWindowContent(HWND hWnd)
+{
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
 	cache.reset();
 
 	SizeF bounds;
 	image->GetPhysicalDimension(&bounds);
 
-	RECT rect { 0, 0, bounds.Width, bounds.Height };
+	RECT rect{ 0, 0, bounds.Width, bounds.Height };
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 	SetWindowText(hWnd, files[current_image].c_str());
 	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
@@ -185,6 +204,29 @@ void NextImage(HWND hWnd)
 	DrawCurrentImage(hWnd);
 }
 
+std::vector<std::wstring> parse_command_line()
+{
+	std::vector<std::wstring>	result;
+
+	LPWSTR* szArglist;
+	int nArgs;
+	int i;
+
+	szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+	if (NULL == szArglist)
+	{
+		return result;
+	}
+
+	for (i = 0; i < nArgs; i++) {
+		result.push_back(std::wstring(szArglist[i]));
+	}
+
+	LocalFree(szArglist);
+
+	return result;
+}
+
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
 	HWND                hWnd;
@@ -192,13 +234,14 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	GdiplusStartupInput gdiplusStartupInput;
 	ULONG_PTR           gdiplusToken;
 
+	auto parameters = parse_command_line();
+
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-	// Initialize GDI+.
 	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
 	BuildExtensionsList();
-	BuildFilesList();
+	BuildFilesList(std::filesystem::path(parameters[1]));
 
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
