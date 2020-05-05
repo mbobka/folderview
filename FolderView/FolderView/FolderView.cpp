@@ -17,11 +17,12 @@ VOID OnPaint(HDC hdc)
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void BuildExtensionsList();
-
+void UpdateWindowContent(HWND hWnd);
 void BuildFilesList();
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
+int	current_image = 0;
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
@@ -126,6 +127,18 @@ void BuildExtensionsList()
 	free(decoders);
 }
 
+void UpdateWindowContent(HWND hWnd) {
+	image.reset(Bitmap::FromFile(files[current_image].c_str()));
+	cache.reset();
+
+	SizeF bounds;
+	image->GetPhysicalDimension(&bounds);
+
+	RECT rect{ 0,0, bounds.Width, bounds.Height };
+	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	HDC          hdc;
@@ -134,15 +147,58 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	case WM_CREATE: {
-		image.reset(Bitmap::FromFile(files[1].c_str()));
+		UpdateWindowContent(hWnd);
+		return 0;
+	}
+	case WM_KEYDOWN: {
+		auto vkey = static_cast<UINT8>(wParam);
 
-		SizeF bounds;
-		image->GetPhysicalDimension(&bounds);
+		switch (vkey) {
+		case VK_NUMPAD8:
+		case VK_UP:
+			current_image--;
+			if (current_image < 0) {
+				MessageBeep(MB_ICONWARNING);
+				current_image = 0;
+				return 0;
+			}
 
-		RECT rect{ 0,0, bounds.Width, bounds.Height };
-		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
-		
+			UpdateWindowContent(hWnd);
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
+
+		case VK_NUMPAD7:
+		case VK_HOME:
+			current_image = 0;
+			UpdateWindowContent(hWnd);
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
+
+		case VK_NUMPAD1:
+		case VK_END:
+			current_image = files.size() - 1;
+			UpdateWindowContent(hWnd);
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
+
+		case VK_ESCAPE:
+			PostQuitMessage(0);
+			return 0;
+
+		case VK_NUMPAD2:
+		case VK_DOWN:
+			current_image++;
+			if (current_image >= files.size()) {
+				MessageBeep(MB_ICONWARNING);
+				current_image = files.size() - 1;
+				return 0;
+			}
+
+			UpdateWindowContent(hWnd);
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
+		}
+
 		return 0;
 	}
 
@@ -154,7 +210,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
-	default:
-		return DefWindowProc(hWnd, message, wParam, lParam);
+
 	}
+	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
