@@ -94,6 +94,8 @@ void UpdateWindowContent(HWND hWnd)
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
 	cache.reset();
 
+	SetWindowText(hWnd, files[current_image].c_str());
+
 	WINDOWPLACEMENT wpl;
 	GetWindowPlacement(hWnd, &wpl);
 
@@ -126,7 +128,6 @@ void UpdateWindowContent(HWND hWnd)
 
 	RECT rect{ 0, 0, bounds.Width, bounds.Height };
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-	SetWindowText(hWnd, files[current_image].c_str());
 	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 }
 
@@ -304,7 +305,6 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		NULL,                     // window menu handle
 		hInstance,                // program instance handle
 		NULL);                    // creation parameters
-
 
 	ShowWindow(hWnd, SW_MAXIMIZE);
 	UpdateWindow(hWnd);
