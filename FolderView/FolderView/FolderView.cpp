@@ -218,7 +218,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	hWnd = CreateWindow(
 		wndClass.lpszClassName,   // window class name
-		TEXT("Getting Started"),  // window caption
+		TEXT("Folder view"),      // window caption
 		WS_OVERLAPPEDWINDOW,      // window style
 		CW_USEDEFAULT,            // initial x position
 		CW_USEDEFAULT,            // initial y position
