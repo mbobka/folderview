@@ -243,6 +243,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	BuildExtensionsList();
 	BuildFilesList(std::filesystem::path(parameters[1]));
 
+	HBRUSH background = CreateSolidBrush(RGB(128,128,128));
+
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
 	wndClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -252,7 +254,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	wndClass.hInstance = hInstance;
 	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
 	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wndClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+	wndClass.hbrBackground = background;
 	wndClass.lpszMenuName = nullptr;
 	wndClass.lpszClassName = TEXT("FolderView");
 	wndClass.hIconSm = nullptr;
@@ -284,6 +286,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	image.reset();
 	cache.reset();
+
+	DeleteObject(background);
 
 	GdiplusShutdown(gdiplusToken);
 	return msg.wParam;
