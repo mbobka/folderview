@@ -1,5 +1,14 @@
 #include "framework.h"
-#include <sstream>
+
+void BuildExtensionsList();
+void UpdateWindowContent(HWND hWnd);
+void BuildFilesList();
+void PreviousImage(HWND hWnd);
+void NextImage(HWND hWnd);
+
+std::vector<std::wstring> extensions;
+std::vector<std::filesystem::path> files;
+size_t current_image = 0;
 
 std::unique_ptr<Bitmap> image;
 std::unique_ptr<CachedBitmap> cache;
@@ -13,79 +22,6 @@ VOID OnPaint(HDC hdc)
 
 	graphics.DrawCachedBitmap(cache.get(), 0, 0);
 }
-
-
-LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-void BuildExtensionsList();
-void UpdateWindowContent(HWND hWnd);
-void BuildFilesList();
-void PreviousImage(HWND hWnd);
-void NextImage(HWND hWnd);
-
-std::vector<std::wstring> extensions;
-std::vector<std::filesystem::path> files;
-int	current_image = 0;
-
-INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
-{
-	HWND                hWnd;
-	MSG                 msg;
-	GdiplusStartupInput gdiplusStartupInput;
-	ULONG_PTR           gdiplusToken;
-
-	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-	// Initialize GDI+.
-	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-
-	BuildExtensionsList();
-	BuildFilesList();
-
-	WNDCLASSEXW wndClass;
-	wndClass.cbSize = sizeof(wndClass);
-	wndClass.style = CS_HREDRAW | CS_VREDRAW;
-	wndClass.lpfnWndProc = WndProc;
-	wndClass.cbClsExtra = 0;
-	wndClass.cbWndExtra = 0;
-	wndClass.hInstance = hInstance;
-	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wndClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-	wndClass.lpszMenuName = nullptr;
-	wndClass.lpszClassName = TEXT("FolderView");
-	wndClass.hIconSm = nullptr;
-
-	RegisterClassEx(&wndClass);
-
-	hWnd = CreateWindow(
-		wndClass.lpszClassName,   // window class name
-		TEXT("Getting Started"),  // window caption
-		WS_OVERLAPPEDWINDOW,      // window style
-		CW_USEDEFAULT,            // initial x position
-		CW_USEDEFAULT,            // initial y position
-		CW_USEDEFAULT,            // initial x size
-		CW_USEDEFAULT,            // initial y size
-		NULL,                     // parent window handle
-		NULL,                     // window menu handle
-		hInstance,                // program instance handle
-		NULL);                    // creation parameters
-
-
-	ShowWindow(hWnd, iCmdShow);
-	UpdateWindow(hWnd);
-
-	while (GetMessage(&msg, NULL, 0, 0))
-	{
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
-	}
-
-	image.reset();
-	cache.reset();
-
-	GdiplusShutdown(gdiplusToken);
-	return msg.wParam;
-}  // WinMain
 
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
@@ -241,3 +177,64 @@ void NextImage(HWND hWnd)
 	UpdateWindowContent(hWnd);
 	InvalidateRect(hWnd, NULL, TRUE);
 }
+
+INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
+{
+	HWND                hWnd;
+	MSG                 msg;
+	GdiplusStartupInput gdiplusStartupInput;
+	ULONG_PTR           gdiplusToken;
+
+	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	// Initialize GDI+.
+	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
+	BuildExtensionsList();
+	BuildFilesList();
+
+	WNDCLASSEXW wndClass;
+	wndClass.cbSize = sizeof(wndClass);
+	wndClass.style = CS_HREDRAW | CS_VREDRAW;
+	wndClass.lpfnWndProc = WndProc;
+	wndClass.cbClsExtra = 0;
+	wndClass.cbWndExtra = 0;
+	wndClass.hInstance = hInstance;
+	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wndClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+	wndClass.lpszMenuName = nullptr;
+	wndClass.lpszClassName = TEXT("FolderView");
+	wndClass.hIconSm = nullptr;
+
+	RegisterClassEx(&wndClass);
+
+	hWnd = CreateWindow(
+		wndClass.lpszClassName,   // window class name
+		TEXT("Getting Started"),  // window caption
+		WS_OVERLAPPEDWINDOW,      // window style
+		CW_USEDEFAULT,            // initial x position
+		CW_USEDEFAULT,            // initial y position
+		CW_USEDEFAULT,            // initial x size
+		CW_USEDEFAULT,            // initial y size
+		NULL,                     // parent window handle
+		NULL,                     // window menu handle
+		hInstance,                // program instance handle
+		NULL);                    // creation parameters
+
+
+	ShowWindow(hWnd, iCmdShow);
+	UpdateWindow(hWnd);
+
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	image.reset();
+	cache.reset();
+
+	GdiplusShutdown(gdiplusToken);
+	return msg.wParam;
+}  // WinMain
