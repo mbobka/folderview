@@ -13,8 +13,3 @@ using namespace Gdiplus;
 #include <iostream>
 #include <filesystem>
 #include <string>
-
-// C RunTime Header Files
-#include <malloc.h>
-#include <memory.h>
-#include <tchar.h>
