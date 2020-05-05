@@ -5,6 +5,8 @@ void UpdateWindowContent(HWND hWnd);
 void BuildFilesList();
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
+void DrawCurrentImage(HWND hWnd);
+
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
@@ -25,7 +27,7 @@ VOID OnPaint(HDC hdc)
 
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
-		if (lstrcmpi(file.extension().c_str(), L".jpg") == 0)
+		if (lstrcmpi(file.extension().c_str(), extension.c_str()) == 0)
 			return true;
 	}
 
@@ -72,9 +74,10 @@ void UpdateWindowContent(HWND hWnd) {
 	SizeF bounds;
 	image->GetPhysicalDimension(&bounds);
 
-	RECT rect{ 0,0, bounds.Width, bounds.Height };
+	RECT rect { 0, 0, bounds.Width, bounds.Height };
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+	SetWindowText(hWnd, files[current_image].c_str());
+	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -108,21 +111,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		switch (vkey) {
 		case VK_NUMPAD8:
 		case VK_UP:
+		case VK_PRIOR:
 			PreviousImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD7:
 		case VK_HOME:
 			current_image = 0;
-			UpdateWindowContent(hWnd);
-			InvalidateRect(hWnd, NULL, TRUE);
+			DrawCurrentImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD1:
 		case VK_END:
 			current_image = files.size() - 1;
-			UpdateWindowContent(hWnd);
-			InvalidateRect(hWnd, NULL, TRUE);
+			DrawCurrentImage(hWnd);
 			return 0;
 
 		case VK_ESCAPE:
@@ -131,6 +133,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		case VK_NUMPAD2:
 		case VK_DOWN:
+		case VK_NEXT:
 			NextImage(hWnd);
 			return 0;
 		}
@@ -147,35 +150,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
-
 	}
+
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
 
+void DrawCurrentImage(HWND hWnd) {
+	UpdateWindowContent(hWnd);
+	InvalidateRect(hWnd, NULL, FALSE);
+}
+
 void PreviousImage(HWND hWnd)
 {
-	current_image--;
-	if (current_image < 0) {
+	if (current_image == 0) {
 		MessageBeep(MB_ICONWARNING);
 		current_image = 0;
 		return;
 	}
 
-	UpdateWindowContent(hWnd);
-	InvalidateRect(hWnd, NULL, TRUE);
+	current_image--;
+
+	DrawCurrentImage(hWnd);
 }
 
 void NextImage(HWND hWnd)
 {
-	current_image++;
-	if (current_image >= files.size()) {
+	if (current_image + 1 >= files.size()) {
 		MessageBeep(MB_ICONWARNING);
-		current_image = files.size() - 1;
 		return;
 	}
 
-	UpdateWindowContent(hWnd);
-	InvalidateRect(hWnd, NULL, TRUE);
+	current_image++;
+
+	DrawCurrentImage(hWnd);
 }
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
