@@ -87,11 +87,42 @@ void BuildExtensionsList()
 
 void UpdateWindowContent(HWND hWnd)
 {
+	std::unique_ptr<Bitmap> old_image;
+
+	old_image.swap(image);
+
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
 	cache.reset();
 
+	WINDOWPLACEMENT wpl;
+	GetWindowPlacement(hWnd, &wpl);
+
 	SizeF bounds;
 	image->GetPhysicalDimension(&bounds);
+
+	if (wpl.showCmd == SW_MAXIMIZE) {
+		if (!old_image)
+			return;
+
+		SizeF old_bounds;
+		old_image->GetPhysicalDimension(&old_bounds);
+
+		{
+			RECT rect{ bounds.Width, 0, old_bounds.Width, old_bounds.Height };
+			if (rect.left <= rect.right)
+				InvalidateRect(hWnd, &rect, TRUE);
+		}
+
+		{
+			RECT rect{ 0, bounds.Height, old_bounds.Width, old_bounds.Height };
+			if (rect.top <= rect.bottom)
+				InvalidateRect(hWnd, &rect, TRUE);
+		}
+
+		old_image.reset();
+
+		return;
+	}
 
 	RECT rect{ 0, 0, bounds.Width, bounds.Height };
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -243,7 +274,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	BuildExtensionsList();
 	BuildFilesList(std::filesystem::path(parameters[1]));
 
-	HBRUSH background = CreateSolidBrush(RGB(128,128,128));
+	HBRUSH background = CreateSolidBrush(RGB(128, 128, 128));
 
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
@@ -275,7 +306,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		NULL);                    // creation parameters
 
 
-	ShowWindow(hWnd, iCmdShow);
+	ShowWindow(hWnd, SW_MAXIMIZE);
 	UpdateWindow(hWnd);
 
 	while (GetMessage(&msg, NULL, 0, 0))
