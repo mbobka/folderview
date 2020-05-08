@@ -1,4 +1,23 @@
-#include "framework.h"
+// for IDE sake
+#include "targetver.h"
+#include "Resource.h"
+
+// Windows Header Files
+#define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
+#include <windows.h>
+#include <shellapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
+using namespace Gdiplus;
+#pragma comment (lib,"Gdiplus.lib")
+#undef min
+#undef max
+
+// Standard library
+#include <iostream>
+#include <filesystem>
+#include <string>
+#include <sstream>
 
 void BuildExtensionsList();
 void UpdateWindowContent(HWND hWnd);
