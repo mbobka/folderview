@@ -5,6 +5,7 @@
 // Windows Header Files
 #define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -29,9 +30,11 @@ void DrawCurrentImage(HWND hWnd);
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
 size_t current_image = 0;
+bool block_changing_of_current_image = false; // запрещает измен€ть текущее изображение, например, при перетаскивании мышкой
 
 std::unique_ptr<Bitmap> image;
 std::unique_ptr<CachedBitmap> cache;
+std::unique_ptr<POINT> image_shift; // насколько изображение сдвинуто
 
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
@@ -140,6 +143,8 @@ void UpdateWindowContent(HWND hWnd)
 	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 }
 
+static POINTS ptsBegin;        // beginning point 
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 
@@ -199,6 +204,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 
+	case WM_LBUTTONDOWN:
+
+		// Capture mouse input. 
+		SetCapture(hWnd);
+
+		// «апретить измен€ть текущее изображение
+		block_changing_of_current_image = true;
+
+		// ”становить курсор руку.
+		SetCursor(LoadCursor(NULL, IDC_HAND));
+
+		// —охранить начальные координаты.
+		ptsBegin = MAKEPOINTS(lParam);
+		return 0;
+
+	case WM_MOUSEMOVE:
+
+		// When moving the mouse, the user must hold down 
+		// the left mouse button to drag the image. 
+
+		if (wParam & MK_LBUTTON)
+		{
+			// ”становить новые координаты сдвига
+			if (!image_shift) {
+				image_shift.reset(new POINT{ 0,0 });
+			}
+
+			image_shift->x -= ptsBegin.x - GET_X_LPARAM(lParam);
+			image_shift->y -= ptsBegin.y - GET_Y_LPARAM(lParam);
+
+			// —охранить новые начальные координаты дл€ отсчЄта сдвига от них.
+			ptsBegin = MAKEPOINTS(lParam);
+
+			// ѕерерисовать содержимое.
+			InvalidateRect(hWnd, NULL, TRUE);
+		}
+		break;
+
+	case WM_LBUTTONUP:
+		// ¬озвратить правильный курсор.
+		SetCursor(LoadCursor(NULL, IDC_ARROW));
+
+		// –азрешить измен€ть текущее изображение
+		block_changing_of_current_image = false;
+
+		// Release the mouse capture. 
+		ReleaseCapture();
+		return 0;
+
 	case WM_PAINT:
 	{
 		PAINTSTRUCT  ps;
@@ -219,7 +273,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		int dw = (clientRect.right - clientRect.left - imageBounds.Width) / 2;
 		int dh = (clientRect.bottom - clientRect.top - imageBounds.Height) / 2;
 
-		graphics.DrawCachedBitmap(cache.get(), std::max(0, dw), std::max(0, dh));
+		int x = std::max(0, dw);
+		int y = std::max(0, dh);
+
+		if (image_shift) {
+			x += image_shift->x;
+			y += image_shift->y;
+		}
+
+		graphics.DrawCachedBitmap(cache.get(), x, y);
 
 		EndPaint(hWnd, &ps);
 		return 0;
@@ -240,6 +302,9 @@ void DrawCurrentImage(HWND hWnd) {
 
 void PreviousImage(HWND hWnd)
 {
+	if (block_changing_of_current_image)
+		return;
+
 	if (current_image == 0) {
 		MessageBeep(MB_ICONWARNING);
 		current_image = 0;
@@ -247,18 +312,23 @@ void PreviousImage(HWND hWnd)
 	}
 
 	current_image--;
+	image_shift.reset();
 
 	DrawCurrentImage(hWnd);
 }
 
 void NextImage(HWND hWnd)
 {
+	if (block_changing_of_current_image)
+		return;
+
 	if (current_image + 1 >= files.size()) {
 		MessageBeep(MB_ICONWARNING);
 		return;
 	}
 
 	current_image++;
+	image_shift.reset();
 
 	DrawCurrentImage(hWnd);
 }
