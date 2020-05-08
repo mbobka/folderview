@@ -26,6 +26,7 @@ void BuildFilesList(std::filesystem::path const& file_or_folder);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
 void DrawCurrentImage(HWND hWnd);
+void CalculateScale(HWND hWnd);
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
@@ -33,8 +34,11 @@ size_t current_image = 0;
 bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
 
 std::unique_ptr<Bitmap> image;
-std::unique_ptr<CachedBitmap> cache;
 std::unique_ptr<POINT> image_shift; // насколько изображение сдвинуто
+
+float scale = 1.0f;
+
+static POINTS ptsBegin;        // beginning point 
 
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
@@ -104,9 +108,10 @@ void UpdateWindowContent(HWND hWnd)
 	old_image.swap(image);
 
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
-	cache.reset();
 
 	SetWindowText(hWnd, files[current_image].c_str());
+
+	CalculateScale(hWnd);
 
 	WINDOWPLACEMENT wpl;
 	GetWindowPlacement(hWnd, &wpl);
@@ -143,15 +148,12 @@ void UpdateWindowContent(HWND hWnd)
 	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 }
 
-static POINTS ptsBegin;        // beginning point 
-
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 
 	switch (message)
 	{
 	case WM_CREATE:
-		UpdateWindowContent(hWnd);
 		return 0;
 
 	case WM_MOUSEWHEEL: {
@@ -181,7 +183,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case VK_NUMPAD7:
 		case VK_HOME:
 			if (block_changing_of_current_image)
-				return;
+				return 0;
 
 			current_image = 0;
 			DrawCurrentImage(hWnd);
@@ -190,7 +192,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case VK_NUMPAD1:
 		case VK_END:
 			if (block_changing_of_current_image)
-				return;
+				return 0;
 
 			current_image = files.size() - 1;
 			DrawCurrentImage(hWnd);
@@ -244,9 +246,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			RECT	clientRect;
 			GetClientRect(hWnd, &clientRect);
 
+			auto cw = clientRect.right - clientRect.left;
+			auto ch = clientRect.bottom - clientRect.top;
+
 			// следующим дапазоном: 
-			auto limit_x = std::max<LONG>(0, -clientRect.right + clientRect.left + imageBounds.Width);
-			auto limit_y = std::max<LONG>(0, -clientRect.bottom + clientRect.top + imageBounds.Height);
+			auto limit_x = std::max<LONG>(0, -cw + imageBounds.Width * scale);
+			auto limit_y = std::max<LONG>(0, -ch + imageBounds.Height * scale);
 
 			POINT old_position = *image_shift;
 
@@ -264,7 +269,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			// Перерисовать содержимое.
 			ScrollWindowEx(hWnd, -old_position.x + image_shift->x, -old_position.y + image_shift->y, NULL, NULL, NULL, NULL, SW_INVALIDATE | SW_ERASE);
-	
+
 			// Сохранить новые начальные координаты для отсчёта сдвига от них.
 			ptsBegin = MAKEPOINTS(lParam);
 		}
@@ -283,13 +288,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_PAINT:
 	{
+		if (!image)
+			UpdateWindowContent(hWnd);
+
 		PAINTSTRUCT  ps;
 		HDC          hdc = BeginPaint(hWnd, &ps);
 
 		Graphics graphics(hdc);
-
-		if (!cache)
-			cache.reset(new CachedBitmap(image.get(), &graphics));
 
 		RectF	imageBounds;
 		Unit	imageUnits;
@@ -298,18 +303,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		RECT	clientRect;
 		GetClientRect(hWnd, &clientRect);
 
-		int dw = (clientRect.right - clientRect.left - imageBounds.Width) / 2;
-		int dh = (clientRect.bottom - clientRect.top - imageBounds.Height) / 2;
+		auto cw = clientRect.right - clientRect.left;
+		auto ch = clientRect.bottom - clientRect.top;
 
-		int x = std::max(0, dw);
-		int y = std::max(0, dh);
+		auto dw = (cw - imageBounds.Width * scale) / 2.0f;
+		auto dh = (ch - imageBounds.Height * scale) / 2.0f;
+
+		auto x = std::max(0.0f, dw);
+		auto y = std::max(0.0f, dh);
 
 		if (image_shift) {
 			x += image_shift->x;
 			y += image_shift->y;
 		}
 
-		graphics.DrawCachedBitmap(cache.get(), x, y);
+		graphics.DrawImage(image.get(), std::round(x), std::round(y), imageBounds.Width * scale, imageBounds.Height * scale);
 
 		EndPaint(hWnd, &ps);
 		return 0;
@@ -322,6 +330,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
+
+void CalculateScale(HWND hWnd) {
+	WINDOWPLACEMENT wpl;
+	GetWindowPlacement(hWnd, &wpl);
+
+	scale = 1.0f;
+
+	if (wpl.showCmd != SW_MAXIMIZE)
+		return;
+
+	RectF	imageBounds;
+	Unit	imageUnits;
+	image->GetBounds(&imageBounds, &imageUnits);
+
+	RECT	clientRect;
+	GetClientRect(hWnd, &clientRect);
+
+	auto cw = clientRect.right - clientRect.left;
+	auto ch = clientRect.bottom - clientRect.top;
+
+
+	if (imageBounds.Width > cw) {
+		scale /= imageBounds.Width / (float)cw;
+	}
+
+	if (imageBounds.Height * scale > ch) {
+		scale /= imageBounds.Height / (float)ch;
+		imageBounds.Height = ch;
+	}
+}
 
 void DrawCurrentImage(HWND hWnd) {
 	UpdateWindowContent(hWnd);
@@ -442,7 +480,6 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	}
 
 	image.reset();
-	cache.reset();
 
 	DeleteObject(background);
 
