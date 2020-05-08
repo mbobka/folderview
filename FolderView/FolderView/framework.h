@@ -10,6 +10,8 @@
 using namespace Gdiplus;
 #pragma comment (lib,"Gdiplus.lib")
 
+#undef min
+#undef max
 #include <iostream>
 #include <filesystem>
 #include <string>

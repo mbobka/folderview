@@ -14,16 +14,6 @@ size_t current_image = 0;
 std::unique_ptr<Bitmap> image;
 std::unique_ptr<CachedBitmap> cache;
 
-VOID OnPaint(HDC hdc)
-{
-	Graphics graphics(hdc);
-
-	if (!cache)
-		cache.reset(new CachedBitmap(image.get(), &graphics));
-
-	graphics.DrawCachedBitmap(cache.get(), 0, 0);
-}
-
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
 		if (lstrcmpi(file.extension().c_str(), extension.c_str()) == 0)
@@ -133,8 +123,6 @@ void UpdateWindowContent(HWND hWnd)
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
-	HDC          hdc;
-	PAINTSTRUCT  ps;
 
 	switch (message)
 	{
@@ -193,10 +181,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	case WM_PAINT:
-		hdc = BeginPaint(hWnd, &ps);
-		OnPaint(hdc);
+	{
+		PAINTSTRUCT  ps;
+		HDC          hdc = BeginPaint(hWnd, &ps);
+
+		Graphics graphics(hdc);
+
+		if (!cache)
+			cache.reset(new CachedBitmap(image.get(), &graphics));
+
+		RectF	imageBounds;
+		Unit	imageUnits;
+		image->GetBounds(&imageBounds, &imageUnits);
+
+		RECT	clientRect;
+		GetClientRect(hWnd, &clientRect);
+
+		int dw = (clientRect.right - clientRect.left - imageBounds.Width) / 2;
+		int dh = (clientRect.bottom - clientRect.top - imageBounds.Height) / 2;
+
+		graphics.DrawCachedBitmap(cache.get(), std::max(0, dw), std::max(0, dh));
+
 		EndPaint(hWnd, &ps);
 		return 0;
+	}
 
 	case WM_DESTROY:
 		PostQuitMessage(0);
