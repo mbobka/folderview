@@ -234,11 +234,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			image_shift->x -= ptsBegin.x - GET_X_LPARAM(lParam);
 			image_shift->y -= ptsBegin.y - GET_Y_LPARAM(lParam);
 
+			// Перерисовать содержимое.
+			ScrollWindowEx(hWnd, -ptsBegin.x + GET_X_LPARAM(lParam), -ptsBegin.y + GET_Y_LPARAM(lParam), NULL, NULL, NULL, NULL, SW_INVALIDATE | SW_ERASE);
+
 			// Сохранить новые начальные координаты для отсчёта сдвига от них.
 			ptsBegin = MAKEPOINTS(lParam);
-
-			// Перерисовать содержимое.
-			InvalidateRect(hWnd, NULL, TRUE);
 		}
 		break;
 
