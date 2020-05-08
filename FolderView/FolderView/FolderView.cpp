@@ -180,12 +180,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		case VK_NUMPAD7:
 		case VK_HOME:
+			if (block_changing_of_current_image)
+				return;
+
 			current_image = 0;
 			DrawCurrentImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD1:
 		case VK_END:
+			if (block_changing_of_current_image)
+				return;
+
 			current_image = files.size() - 1;
 			DrawCurrentImage(hWnd);
 			return 0;
