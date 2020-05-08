@@ -300,7 +300,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
 	BuildExtensionsList();
-	BuildFilesList(std::filesystem::path(parameters[1]));
+
+	BuildFilesList(parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path());
 
 	HBRUSH background = CreateSolidBrush(RGB(128, 128, 128));
 
