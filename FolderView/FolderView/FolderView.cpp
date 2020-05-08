@@ -226,17 +226,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (wParam & MK_LBUTTON)
 		{
-			// Установить новые координаты сдвига
+			// Установить новые координаты сдвига, ограничивая их изменения
 			if (!image_shift) {
 				image_shift.reset(new POINT{ 0,0 });
 			}
 
-			image_shift->x -= ptsBegin.x - GET_X_LPARAM(lParam);
-			image_shift->y -= ptsBegin.y - GET_Y_LPARAM(lParam);
+			RectF	imageBounds;
+			Unit	imageUnits;
+			image->GetBounds(&imageBounds, &imageUnits);
+
+			RECT	clientRect;
+			GetClientRect(hWnd, &clientRect);
+
+			// следующим дапазоном: 
+			auto limit_x = std::max<LONG>(0, -clientRect.right + clientRect.left + imageBounds.Width);
+			auto limit_y = std::max<LONG>(0, -clientRect.bottom + clientRect.top + imageBounds.Height);
+
+			POINT old_position = *image_shift;
+
+			auto dx = -ptsBegin.x + GET_X_LPARAM(lParam);
+			auto dy = -ptsBegin.y + GET_Y_LPARAM(lParam);
+
+			image_shift->x += dx;
+			image_shift->y += dy;
+
+			auto coalesced_shift_x = -std::max((LONG)0, std::min(limit_x, -image_shift->x));
+			auto coalesced_shift_y = -std::max((LONG)0, std::min(limit_y, -image_shift->y));
+
+			image_shift->x = coalesced_shift_x;
+			image_shift->y = coalesced_shift_y;
 
 			// Перерисовать содержимое.
-			ScrollWindowEx(hWnd, -ptsBegin.x + GET_X_LPARAM(lParam), -ptsBegin.y + GET_Y_LPARAM(lParam), NULL, NULL, NULL, NULL, SW_INVALIDATE | SW_ERASE);
-
+			ScrollWindowEx(hWnd, -old_position.x + image_shift->x, -old_position.y + image_shift->y, NULL, NULL, NULL, NULL, SW_INVALIDATE | SW_ERASE);
+	
 			// Сохранить новые начальные координаты для отсчёта сдвига от них.
 			ptsBegin = MAKEPOINTS(lParam);
 		}
