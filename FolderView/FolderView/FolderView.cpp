@@ -1,4 +1,4 @@
-// for IDE sake
+п»ї// for IDE sake
 #include "targetver.h"
 #include "Resource.h"
 
@@ -31,10 +31,10 @@ void CalculateScale(HWND hWnd);
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
 size_t current_image = 0;
-bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
+bool block_changing_of_current_image = false; // Р·Р°РїСЂРµС‰Р°РµС‚ РёР·РјРµРЅСЏС‚СЊ С‚РµРєСѓС‰РµРµ РёР·РѕР±СЂР°Р¶РµРЅРёРµ, РЅР°РїСЂРёРјРµСЂ, РїСЂРё РїРµСЂРµС‚Р°СЃРєРёРІР°РЅРёРё РјС‹С€РєРѕР№
 
 std::unique_ptr<Bitmap> image;
-std::unique_ptr<POINT> image_shift; // насколько изображение сдвинуто
+std::unique_ptr<POINT> image_shift; // РЅР°СЃРєРѕР»СЊРєРѕ РёР·РѕР±СЂР°Р¶РµРЅРёРµ СЃРґРІРёРЅСѓС‚Рѕ
 
 float scale = 1.0f;
 
@@ -53,7 +53,7 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 {
 	std::filesystem::directory_entry entry(file_or_folder);
 	if (!entry.exists()) {
-		MessageBox(NULL, L"Путь не найден", L"Folder view", MB_OK | MB_ICONERROR);
+		MessageBox(NULL, L"РџСѓС‚СЊ РЅРµ РЅР°Р№РґРµРЅ", L"Folder view", MB_OK | MB_ICONERROR);
 		return;
 	}
 
@@ -217,13 +217,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// Capture mouse input. 
 		SetCapture(hWnd);
 
-		// Запретить изменять текущее изображение
+		// Р—Р°РїСЂРµС‚РёС‚СЊ РёР·РјРµРЅСЏС‚СЊ С‚РµРєСѓС‰РµРµ РёР·РѕР±СЂР°Р¶РµРЅРёРµ
 		block_changing_of_current_image = true;
 
-		// Установить курсор руку.
+		// РЈСЃС‚Р°РЅРѕРІРёС‚СЊ РєСѓСЂСЃРѕСЂ СЂСѓРєСѓ.
 		SetCursor(LoadCursor(NULL, IDC_HAND));
 
-		// Сохранить начальные координаты.
+		// РЎРѕС…СЂР°РЅРёС‚СЊ РЅР°С‡Р°Р»СЊРЅС‹Рµ РєРѕРѕСЂРґРёРЅР°С‚С‹.
 		ptsBegin = MAKEPOINTS(lParam);
 		return 0;
 
@@ -234,7 +234,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (wParam & MK_LBUTTON)
 		{
-			// Установить новые координаты сдвига, ограничивая их изменения
+			// РЈСЃС‚Р°РЅРѕРІРёС‚СЊ РЅРѕРІС‹Рµ РєРѕРѕСЂРґРёРЅР°С‚С‹ СЃРґРІРёРіР°, РѕРіСЂР°РЅРёС‡РёРІР°СЏ РёС… РёР·РјРµРЅРµРЅРёСЏ
 			if (!image_shift) {
 				image_shift.reset(new POINT{ 0,0 });
 			}
@@ -249,7 +249,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			auto cw = clientRect.right - clientRect.left;
 			auto ch = clientRect.bottom - clientRect.top;
 
-			// следующим дапазоном: 
+			// СЃР»РµРґСѓСЋС‰РёРј РґР°РїР°Р·РѕРЅРѕРј: 
 			auto limit_x = std::max<LONG>(0, -cw + imageBounds.Width * scale);
 			auto limit_y = std::max<LONG>(0, -ch + imageBounds.Height * scale);
 
@@ -267,19 +267,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			image_shift->x = coalesced_shift_x;
 			image_shift->y = coalesced_shift_y;
 
-			// Перерисовать содержимое.
+			// РџРµСЂРµСЂРёСЃРѕРІР°С‚СЊ СЃРѕРґРµСЂР¶РёРјРѕРµ.
 			ScrollWindowEx(hWnd, -old_position.x + image_shift->x, -old_position.y + image_shift->y, NULL, NULL, NULL, NULL, SW_INVALIDATE | SW_ERASE);
 
-			// Сохранить новые начальные координаты для отсчёта сдвига от них.
+			// РЎРѕС…СЂР°РЅРёС‚СЊ РЅРѕРІС‹Рµ РЅР°С‡Р°Р»СЊРЅС‹Рµ РєРѕРѕСЂРґРёРЅР°С‚С‹ РґР»СЏ РѕС‚СЃС‡С‘С‚Р° СЃРґРІРёРіР° РѕС‚ РЅРёС….
 			ptsBegin = MAKEPOINTS(lParam);
 		}
 		break;
 
 	case WM_LBUTTONUP:
-		// Возвратить правильный курсор.
+		// Р’РѕР·РІСЂР°С‚РёС‚СЊ РїСЂР°РІРёР»СЊРЅС‹Р№ РєСѓСЂСЃРѕСЂ.
 		SetCursor(LoadCursor(NULL, IDC_ARROW));
 
-		// Разрешить изменять текущее изображение
+		// Р Р°Р·СЂРµС€РёС‚СЊ РёР·РјРµРЅСЏС‚СЊ С‚РµРєСѓС‰РµРµ РёР·РѕР±СЂР°Р¶РµРЅРёРµ
 		block_changing_of_current_image = false;
 
 		// Release the mouse capture. 
