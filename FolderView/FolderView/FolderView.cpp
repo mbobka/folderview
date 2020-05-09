@@ -44,14 +44,6 @@ float scale = 1.0f;
 
 static POINTS ptsBegin;        // beginning point 
 
-class COleInitialize {
-public:
-	COleInitialize() : m_hr(OleInitialize(NULL)) { }
-	~COleInitialize() { if (SUCCEEDED(m_hr)) OleUninitialize(); }
-	operator HRESULT() const { return m_hr; }
-	HRESULT m_hr;
-};
-
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
 		if (lstrcmpi(file.extension().c_str(), extension.c_str()) == 0)
@@ -282,9 +274,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (GetKeyState(VK_CONTROL) & 0x8000) {
 				CComPtr<IDataObject> spdto;
 
-				GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto));
-				OleSetClipboard(spdto);
-				OleFlushClipboard();
+				if (FAILED(GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto)))||
+					FAILED(OleSetClipboard(spdto))||
+					FAILED(OleFlushClipboard()))
+				{
+					MessageBeep(MB_ICONERROR);
+					return 0;
+				}
+
 				return 0;
 			}
 		}
@@ -505,7 +502,7 @@ std::vector<std::wstring> parse_command_line()
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
-	COleInitialize	ole_init;
+	OleInitialize(NULL);
 
 	HWND                hWnd;
 	MSG                 msg;
@@ -567,5 +564,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	DeleteObject(background);
 
 	GdiplusShutdown(gdiplusToken);
+
+	OleUninitialize();
+
 	return msg.wParam;
 }  // WinMain
