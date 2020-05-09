@@ -22,6 +22,8 @@ using namespace Gdiplus;
 #include <string>
 #include <sstream>
 
+#include "AlmostEquals.h"
+
 void BuildExtensionsList();
 void UpdateWindowContent(HWND hWnd);
 void BuildFilesList(std::filesystem::path const& file_or_folder);
@@ -203,8 +205,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		auto vkey = static_cast<UINT8>(wParam);
 
 		switch (vkey) {
-		case VK_NUMPAD8:
 		case VK_UP:
+			if (GetKeyState(VK_CONTROL) & 0x8000)
+				goto scale_up;
+
+		case VK_NUMPAD8:
 		case VK_PRIOR:
 			PreviousImage(hWnd);
 			return 0;
@@ -231,13 +236,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			PostQuitMessage(0);
 			return 0;
 
-		case VK_NUMPAD2:
 		case VK_DOWN:
+			if (GetKeyState(VK_CONTROL) & 0x8000)
+				goto scale_down;
+
+		case VK_NUMPAD2:
 		case VK_NEXT:
 			NextImage(hWnd);
 			return 0;
 
 		case VK_ADD:
+		scale_up:
 			if (scale > 10000.0f)
 				return 0;
 
@@ -246,6 +255,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 
 		case VK_SUBTRACT:
+		scale_down:
 			if (scale < 0.00001f)
 				return 0;
 
@@ -253,9 +263,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			InvalidateRect(hWnd, NULL, TRUE);
 			return 0;
 
+		case '0':
 		case VK_MULTIPLY:
-			if (fabs(scale - 1.0f) < 0.000001f)
+			if (AlmostEquals(scale, 1.0f)) {
 				CalculateScale(hWnd);
+				if (AlmostEquals(scale, 1.0f))
+					return 0;
+			}
 			else
 				scale = 1.0f;
 
@@ -263,7 +277,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 
 		case VK_INSERT:
-		case 'C': 
+		case 'C':
 		{
 			if (GetKeyState(VK_CONTROL) & 0x8000) {
 				CComPtr<IDataObject> spdto;

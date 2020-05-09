@@ -146,6 +146,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="FolderView.cpp" />
+    <ClCompile Include="AlmostEquals.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="FolderView.rc" />

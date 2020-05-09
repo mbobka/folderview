@@ -26,6 +26,9 @@
     <ClCompile Include="FolderView.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AlmostEquals.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="FolderView.rc">
