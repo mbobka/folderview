@@ -356,7 +356,7 @@ void CalculateScale(HWND hWnd) {
 	}
 
 	if (imageBounds.Height * scale > ch) {
-		scale /= imageBounds.Height / (float)ch;
+		scale /= imageBounds.Height * scale / (float)ch;
 		imageBounds.Height = ch;
 	}
 }
