@@ -207,6 +207,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case VK_NEXT:
 			NextImage(hWnd);
 			return 0;
+
+		case VK_ADD:
+			if (scale > 10000.0f)
+				return 0;
+
+			scale *= 2.0f;
+			InvalidateRect(hWnd, NULL, FALSE);
+			return 0;
+
+		case VK_SUBTRACT:
+			if (scale < 0.00001f)
+				return 0;
+
+			scale *= 0.5f;
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
+
+		case VK_MULTIPLY:
+			if (fabs(scale - 1.0f) < 0.000001f)
+				CalculateScale(hWnd);
+			else
+				scale = 1.0f;
+
+			InvalidateRect(hWnd, NULL, TRUE);
+			return 0;
 		}
 
 		return 0;
