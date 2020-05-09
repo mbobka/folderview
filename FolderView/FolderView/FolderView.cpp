@@ -9,6 +9,8 @@
 #include <shellapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <shlobj.h>
+#include <atlbase.h>
 using namespace Gdiplus;
 #pragma comment (lib,"Gdiplus.lib")
 #undef min
@@ -40,6 +42,14 @@ float scale = 1.0f;
 
 static POINTS ptsBegin;        // beginning point 
 
+class COleInitialize {
+public:
+	COleInitialize() : m_hr(OleInitialize(NULL)) { }
+	~COleInitialize() { if (SUCCEEDED(m_hr)) OleUninitialize(); }
+	operator HRESULT() const { return m_hr; }
+	HRESULT m_hr;
+};
+
 bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	for (auto extension : extensions) {
 		if (lstrcmpi(file.extension().c_str(), extension.c_str()) == 0)
@@ -47,6 +57,25 @@ bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	}
 
 	return false;
+}
+
+HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
+{
+	*ppv = NULL;
+	HRESULT hr;
+	LPITEMIDLIST pidl;
+	SFGAOF sfgao;
+	if (SUCCEEDED(hr = SHParseDisplayName(pszPath, NULL, &pidl, 0, &sfgao))) {
+		IShellFolder* psf;
+		LPCITEMIDLIST pidlChild;
+		if (SUCCEEDED(hr = SHBindToParent(pidl, IID_IShellFolder,
+			(void**)&psf, &pidlChild))) {
+			hr = psf->GetUIObjectOf(hwnd, 1, &pidlChild, riid, NULL, ppv);
+			psf->Release();
+		}
+		CoTaskMemFree(pidl);
+	}
+	return hr;
 }
 
 void BuildFilesList(std::filesystem::path const& file_or_folder)
@@ -232,9 +261,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			InvalidateRect(hWnd, NULL, TRUE);
 			return 0;
+
+		case VK_INSERT:
+		case 'C': 
+		{
+			if (GetKeyState(VK_CONTROL) & 0x8000) {
+				CComPtr<IDataObject> spdto;
+
+				GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto));
+				OleSetClipboard(spdto);
+				OleFlushClipboard();
+				return 0;
+			}
+		}
 		}
 
-		return 0;
+		break;
 	}
 
 	case WM_LBUTTONDOWN:
@@ -449,6 +491,8 @@ std::vector<std::wstring> parse_command_line()
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
+	COleInitialize	ole_init;
+
 	HWND                hWnd;
 	MSG                 msg;
 	GdiplusStartupInput gdiplusStartupInput;
