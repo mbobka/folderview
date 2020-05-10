@@ -274,8 +274,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (GetKeyState(VK_CONTROL) & 0x8000) {
 				CComPtr<IDataObject> spdto;
 
-				if (FAILED(GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto)))||
-					FAILED(OleSetClipboard(spdto))||
+				if (FAILED(GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto))) ||
+					FAILED(OleSetClipboard(spdto)) ||
 					FAILED(OleFlushClipboard()))
 				{
 					MessageBeep(MB_ICONERROR);
@@ -372,8 +372,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		PAINTSTRUCT  ps;
 		HDC          hdc = BeginPaint(hWnd, &ps);
 
-		Graphics graphics(hdc);
-
 		RectF	imageBounds;
 		Unit	imageUnits;
 		image->GetBounds(&imageBounds, &imageUnits);
@@ -387,15 +385,38 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		auto dw = (cw - imageBounds.Width * scale) / 2.0f;
 		auto dh = (ch - imageBounds.Height * scale) / 2.0f;
 
+		int iw = std::round(std::min<float>(cw, imageBounds.Width * scale));
+		int ih = std::round(std::min<float>(ch, imageBounds.Height * scale));
+
+		HBITMAP rendered;
+
+		{
+			Bitmap b(iw, ih);
+			std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
+
+			if (image_shift)
+				g->TranslateTransform(image_shift->x, image_shift->y);
+
+			g->ScaleTransform(scale, scale);
+
+			g->DrawImage(image.get(), 0.0f, 0.0f, imageBounds.Width, imageBounds.Height);
+
+			g.reset();
+
+			b.GetHBITMAP(Color::Black, &rendered);
+		}
+
 		auto x = std::max(0.0f, dw);
 		auto y = std::max(0.0f, dh);
 
-		if (image_shift) {
-			x += image_shift->x;
-			y += image_shift->y;
-		}
+		HDC dcMemory = CreateCompatibleDC(hdc);
 
-		graphics.DrawImage(image.get(), std::round(x), std::round(y), imageBounds.Width * scale, imageBounds.Height * scale);
+		SelectObject(dcMemory, rendered);
+
+		BitBlt(hdc, x, y, iw, ih, dcMemory, 0, 0, SRCCOPY);
+
+		DeleteObject(rendered);
+		DeleteDC(dcMemory);
 
 		EndPaint(hWnd, &ps);
 		return 0;
