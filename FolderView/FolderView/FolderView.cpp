@@ -129,9 +129,38 @@ void BuildExtensionsList()
 	free(decoders);
 }
 
+Rect CalculateImageRect(HWND hwnd) {
+	RectF	imageBounds;
+	Unit	imageUnits;
+	image->GetBounds(&imageBounds, &imageUnits);
+
+	RECT	clientRect;
+	GetClientRect(hwnd, &clientRect);
+
+	auto cw = clientRect.right - clientRect.left;
+	auto ch = clientRect.bottom - clientRect.top;
+
+	auto dw = (cw - imageBounds.Width * scale) / 2.0f;
+	auto dh = (ch - imageBounds.Height * scale) / 2.0f;
+
+	auto x = std::max(0.0f, dw);
+	auto y = std::max(0.0f, dh);
+
+	int iw = std::round(std::min<float>(cw, imageBounds.Width * scale));
+	int ih = std::round(std::min<float>(ch, imageBounds.Height * scale));
+
+	return Rect(Point(x, y), Size(iw, ih));
+}
+
+Rect old_image_rect, new_image_rect;
+
 void UpdateWindowContent(HWND hWnd)
 {
 	std::unique_ptr<Bitmap> old_image;
+
+	if (image) {
+		old_image_rect = CalculateImageRect(hWnd);
+	}
 
 	old_image.swap(image);
 
@@ -147,33 +176,19 @@ void UpdateWindowContent(HWND hWnd)
 	SizeF bounds;
 	image->GetPhysicalDimension(&bounds);
 
-	if (wpl.showCmd == SW_MAXIMIZE) {
-		if (!old_image)
-			return;
-
-		SizeF old_bounds;
-		old_image->GetPhysicalDimension(&old_bounds);
-
-		{
-			RECT rect{ bounds.Width, 0, old_bounds.Width, old_bounds.Height };
-			if (rect.left <= rect.right)
-				InvalidateRect(hWnd, &rect, TRUE);
-		}
-
-		{
-			RECT rect{ 0, bounds.Height, old_bounds.Width, old_bounds.Height };
-			if (rect.top <= rect.bottom)
-				InvalidateRect(hWnd, &rect, TRUE);
-		}
-
-		old_image.reset();
-
-		return;
+	if (wpl.showCmd != SW_MAXIMIZE) {
+		RECT rect{ 0, 0, bounds.Width, bounds.Height };
+		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 	}
 
-	RECT rect{ 0, 0, bounds.Width, bounds.Height };
-	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-	SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
+	new_image_rect = CalculateImageRect(hWnd);
+	if (!old_image)
+		old_image_rect = new_image_rect;
+	else
+		old_image.reset();
+
+	InvalidateRect(hWnd, nullptr, TRUE);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -369,6 +384,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		ReleaseCapture();
 		return 0;
 
+	case WM_ERASEBKGND: {
+		Graphics hp((HDC)wParam);
+
+		RECT	clientRect;
+		GetClientRect(hWnd, &clientRect);
+
+		Rect overlap;
+
+		if (!image) {
+			Rect r0(clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
+
+			SolidBrush f0(Color::DarkGray);
+
+			hp.FillRectangle(&f0, r0);
+
+			return 1L;
+		}
+
+		if (Rect::Intersect(overlap, new_image_rect, old_image_rect)) {
+			int oix = clientRect.left;
+			int oiy = clientRect.top;
+			int oixw = clientRect.right;
+			int oiyh = clientRect.bottom;
+
+			int ovx = overlap.X;
+			int ovy = overlap.Y;
+			int ovxw = overlap.X + overlap.Width;
+			int ovyh = overlap.Y + overlap.Height;
+
+			Rect r0(oix, oiy, oixw - oix, ovy - oiy);
+			Rect r1(oix, ovy, ovx - oix, ovyh - ovy);
+			Rect r2(ovxw, ovy, oixw - ovxw, ovyh - ovy);
+			Rect r3(oix, ovyh, oixw - oix, oiyh - ovyh);
+
+			SolidBrush f0(Color::DarkGray);
+			SolidBrush f1(Color::DarkGray);
+			SolidBrush f2(Color::DarkGray);
+			SolidBrush f3(Color::DarkGray);
+
+			hp.FillRectangle(&f0, r0);
+			hp.FillRectangle(&f1, r1);
+			hp.FillRectangle(&f2, r2);
+			hp.FillRectangle(&f3, r3);
+		}
+
+		return 1L;
+	}
+
 	case WM_PAINT:
 	{
 		if (!image)
@@ -377,21 +440,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		PAINTSTRUCT  ps;
 		HDC          hdc = BeginPaint(hWnd, &ps);
 
-		RectF	imageBounds;
-		Unit	imageUnits;
-		image->GetBounds(&imageBounds, &imageUnits);
-
-		RECT	clientRect;
-		GetClientRect(hWnd, &clientRect);
-
-		auto cw = clientRect.right - clientRect.left;
-		auto ch = clientRect.bottom - clientRect.top;
-
-		auto dw = (cw - imageBounds.Width * scale) / 2.0f;
-		auto dh = (ch - imageBounds.Height * scale) / 2.0f;
-
-		int iw = std::round(std::min<float>(cw, imageBounds.Width * scale));
-		int ih = std::round(std::min<float>(ch, imageBounds.Height * scale));
+		auto image_rect = CalculateImageRect(hWnd);
 
 		Graphics hp(hdc);
 
@@ -400,9 +449,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		int cached_w = std::get<1>(bitmaps[current_image]);
 		int cached_h = std::get<2>(bitmaps[current_image]);
 
-		if (image_shift || !cached_bitmap || cached_w != iw || cached_h != ih)
+		if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
 		{
-			std::unique_ptr<Bitmap>  b(new Bitmap(iw, ih));
+			std::unique_ptr<Bitmap>  b(new Bitmap(image_rect.Width, image_rect.Height));
 			std::unique_ptr<Graphics> g(Graphics::FromImage(b.get()));
 
 			if (image_shift)
@@ -410,22 +459,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			g->ScaleTransform(scale, scale);
 
+			RectF	imageBounds;
+			Unit	imageUnits;
+			image->GetBounds(&imageBounds, &imageUnits);
+
 			g->DrawImage(image.get(), 0.0f, 0.0f, imageBounds.Width, imageBounds.Height);
 
 			g.reset();
 
 			cached_bitmap = new CachedBitmap(b.get(), &hp);
 
-			cached_h = ih;
-			cached_w = iw;
+			cached_h = image_rect.Height;
+			cached_w = image_rect.Width;
 
 			bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
 		}
 
-		auto x = std::max(0.0f, dw);
-		auto y = std::max(0.0f, dh);
-
-		hp.DrawCachedBitmap(cached_bitmap, x, y);
+		hp.DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
 
 		EndPaint(hWnd, &ps);
 		return 0;
@@ -458,7 +508,6 @@ void CalculateScale(HWND hWnd) {
 	auto cw = clientRect.right - clientRect.left;
 	auto ch = clientRect.bottom - clientRect.top;
 
-
 	if (imageBounds.Width > cw) {
 		scale /= imageBounds.Width / (float)cw;
 	}
@@ -471,7 +520,6 @@ void CalculateScale(HWND hWnd) {
 
 void DrawCurrentImage(HWND hWnd) {
 	UpdateWindowContent(hWnd);
-	InvalidateRect(hWnd, NULL, FALSE);
 }
 
 void PreviousImage(HWND hWnd)
@@ -545,9 +593,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	BuildExtensionsList();
 
-	BuildFilesList(parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path());
-
-	HBRUSH background = CreateSolidBrush(RGB(128, 128, 128));
+	auto root = parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path();
+	BuildFilesList(root);
 
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
@@ -558,7 +605,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	wndClass.hInstance = hInstance;
 	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
 	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wndClass.hbrBackground = background;
+	wndClass.hbrBackground = nullptr;
 	wndClass.lpszMenuName = nullptr;
 	wndClass.lpszClassName = TEXT("FolderView");
 	wndClass.hIconSm = nullptr;
@@ -588,8 +635,6 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	}
 
 	image.reset();
-
-	DeleteObject(background);
 
 	bitmaps.clear();
 
