@@ -34,6 +34,9 @@ void CalculateScale(HWND hWnd);
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
+
+std::vector<std::tuple<std::unique_ptr<CachedBitmap>, int, int>> bitmaps;
+
 size_t current_image = 0;
 bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
 
@@ -103,6 +106,8 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 
 		files.push_back(entryx.path());
 	}
+
+	bitmaps.resize(files.size());
 }
 
 void BuildExtensionsList()
@@ -388,11 +393,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		int iw = std::round(std::min<float>(cw, imageBounds.Width * scale));
 		int ih = std::round(std::min<float>(ch, imageBounds.Height * scale));
 
-		HBITMAP rendered;
+		Graphics hp(hdc);
 
+		CachedBitmap* cached_bitmap = std::get<0>(bitmaps[current_image]).get();
+
+		int cached_w = std::get<1>(bitmaps[current_image]);
+		int cached_h = std::get<2>(bitmaps[current_image]);
+
+		if (image_shift || !cached_bitmap || cached_w != iw || cached_h != ih)
 		{
-			Bitmap b(iw, ih);
-			std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
+			std::unique_ptr<Bitmap>  b(new Bitmap(iw, ih));
+			std::unique_ptr<Graphics> g(Graphics::FromImage(b.get()));
 
 			if (image_shift)
 				g->TranslateTransform(image_shift->x, image_shift->y);
@@ -403,20 +414,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			g.reset();
 
-			b.GetHBITMAP(Color::Black, &rendered);
+			cached_bitmap = new CachedBitmap(b.get(), &hp);
+
+			cached_h = ih;
+			cached_w = iw;
+
+			bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
 		}
 
 		auto x = std::max(0.0f, dw);
 		auto y = std::max(0.0f, dh);
 
-		HDC dcMemory = CreateCompatibleDC(hdc);
-
-		SelectObject(dcMemory, rendered);
-
-		BitBlt(hdc, x, y, iw, ih, dcMemory, 0, 0, SRCCOPY);
-
-		DeleteObject(rendered);
-		DeleteDC(dcMemory);
+		hp.DrawCachedBitmap(cached_bitmap, x, y);
 
 		EndPaint(hWnd, &ps);
 		return 0;
@@ -583,6 +592,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	image.reset();
 
 	DeleteObject(background);
+
+	bitmaps.clear();
 
 	GdiplusShutdown(gdiplusToken);
 
