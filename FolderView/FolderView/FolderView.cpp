@@ -480,7 +480,6 @@ void PreviousImage(HWND hWnd)
 		return;
 
 	if (current_image == 0) {
-		MessageBeep(MB_ICONWARNING);
 		current_image = 0;
 		return;
 	}
@@ -497,7 +496,6 @@ void NextImage(HWND hWnd)
 		return;
 
 	if (current_image + 1 >= files.size()) {
-		MessageBeep(MB_ICONWARNING);
 		return;
 	}
 
