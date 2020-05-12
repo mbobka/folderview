@@ -154,6 +154,43 @@ Rect CalculateImageRect(HWND hwnd) {
 
 Rect old_image_rect, new_image_rect;
 
+LPCTSTR pixelFormat(PixelFormat pf) {
+	switch(pf) {
+	case PixelFormat1bppIndexed:   return TEXT("1bpp Indexed");
+	case PixelFormat4bppIndexed:   return TEXT("4bpp Indexed");
+	case PixelFormat8bppIndexed:   return TEXT("8bpp Indexed");
+	case PixelFormat16bppGrayScale:return TEXT("16bpp GrayScale");
+	case PixelFormat16bppRGB555:   return TEXT("16bpp RGB555");
+	case PixelFormat16bppRGB565:   return TEXT("16bpp RGB565");
+	case PixelFormat16bppARGB1555: return TEXT("16bpp ARGB1555");
+	case PixelFormat24bppRGB:	   return TEXT("24bpp RGB");
+	case PixelFormat32bppRGB:	   return TEXT("32bpp RGB");
+	case PixelFormat32bppARGB:	   return TEXT("32bpp ARGB");
+	case PixelFormat32bppPARGB:	   return TEXT("32bpp PARGB");
+	case PixelFormat48bppRGB:	   return TEXT("48bpp RGB");
+	case PixelFormat64bppARGB:	   return TEXT("64bpp ARGB");
+	case PixelFormat64bppPARGB:	   return TEXT("64bpp PARGB");
+	case PixelFormat32bppCMYK:	   return TEXT("32bpp CMYK");
+	}
+	return nullptr;
+}
+
+LPCTSTR getFormat(GUID& formatGuid) {
+	if (IsEqualGUID(formatGuid, ImageFormatBMP)) return TEXT("BMP");
+	if (IsEqualGUID(formatGuid, ImageFormatEMF)) return TEXT("EMF");
+	if (IsEqualGUID(formatGuid, ImageFormatWMF)) return TEXT("WMF");
+	if (IsEqualGUID(formatGuid, ImageFormatJPEG)) return TEXT("JPEG");
+	if (IsEqualGUID(formatGuid, ImageFormatPNG)) return TEXT("PNG");
+	if (IsEqualGUID(formatGuid, ImageFormatGIF)) return TEXT("GIF");
+	if (IsEqualGUID(formatGuid, ImageFormatTIFF)) return TEXT("TIFF");
+	if (IsEqualGUID(formatGuid, ImageFormatEXIF)) return TEXT("EXIF");
+	if (IsEqualGUID(formatGuid, ImageFormatIcon)) return TEXT("Icon");
+	if (IsEqualGUID(formatGuid, ImageFormatHEIF)) return TEXT("HEIF");
+	if (IsEqualGUID(formatGuid, ImageFormatWEBP)) return TEXT("WEBP");
+
+	return nullptr;
+}
+
 void UpdateWindowContent(HWND hWnd)
 {
 	std::unique_ptr<Bitmap> old_image;
@@ -166,15 +203,37 @@ void UpdateWindowContent(HWND hWnd)
 
 	image.reset(Bitmap::FromFile(files[current_image].c_str()));
 
-	SetWindowText(hWnd, files[current_image].c_str());
+	std::wstringstream	header;
 
 	CalculateScale(hWnd);
 
 	WINDOWPLACEMENT wpl;
 	GetWindowPlacement(hWnd, &wpl);
 
+	auto pixel_format = image->GetPixelFormat();
 	SizeF bounds;
 	image->GetPhysicalDimension(&bounds);
+
+	header
+		<< files[current_image].c_str();
+		
+	GUID	raw_format;
+	image->GetRawFormat(&raw_format);
+
+	if (getFormat(raw_format))
+		header << L" " << getFormat(raw_format);
+
+	header
+		<< L" [" << (int)bounds.Width << "x" << (int)bounds.Height;
+	
+	if (pixelFormat(pixel_format))
+		header << L" " << pixelFormat(pixel_format);
+
+	header
+		<< L"] "
+		<< std::fixed << std::setprecision(0) << scale * 100.0f << L"%";
+
+	SetWindowText(hWnd, header.str().c_str());
 
 	if (wpl.showCmd != SW_MAXIMIZE) {
 		RECT rect{ 0, 0, bounds.Width, bounds.Height };
