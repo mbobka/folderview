@@ -510,8 +510,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
 		{
-			std::unique_ptr<Bitmap>  b(new Bitmap(image_rect.Width, image_rect.Height));
-			std::unique_ptr<Graphics> g(Graphics::FromImage(b.get()));
+			Bitmap  b(image_rect.Width, image_rect.Height);
+			std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
 
 			if (image_shift)
 				g->TranslateTransform(image_shift->x, image_shift->y);
@@ -526,12 +526,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			g.reset();
 
-			cached_bitmap = new CachedBitmap(b.get(), &hp);
+			cached_bitmap = new CachedBitmap(&b, &hp);
 
 			cached_h = image_rect.Height;
 			cached_w = image_rect.Width;
 
 			bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
+
+			const int cache_epsilon = 20; // сколько в окресности держать кешированных изображений
+			for (int i = 0; i < (int)current_image - cache_epsilon; i++) {
+				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+			}
+			for (int i = current_image + cache_epsilon; i < bitmaps.size(); i++) {
+				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+			}
 		}
 
 		hp.DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
