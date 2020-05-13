@@ -532,6 +532,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			cached_w = image_rect.Width;
 
 			bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
+
+			const int cache_epsilon = 20; // сколько в окресности держать кешированных изображений
+			for (int i = 0; i < (int)current_image - cache_epsilon; i++) {
+				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+			}
+			for (int i = current_image + cache_epsilon; i < bitmaps.size(); i++) {
+				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+			}
 		}
 
 		hp.DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
