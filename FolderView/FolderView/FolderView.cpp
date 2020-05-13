@@ -510,8 +510,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
 		{
-			std::unique_ptr<Bitmap>  b(new Bitmap(image_rect.Width, image_rect.Height));
-			std::unique_ptr<Graphics> g(Graphics::FromImage(b.get()));
+			Bitmap  b(image_rect.Width, image_rect.Height);
+			std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
 
 			if (image_shift)
 				g->TranslateTransform(image_shift->x, image_shift->y);
@@ -526,7 +526,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			g.reset();
 
-			cached_bitmap = new CachedBitmap(b.get(), &hp);
+			cached_bitmap = new CachedBitmap(&b, &hp);
 
 			cached_h = image_rect.Height;
 			cached_w = image_rect.Width;
