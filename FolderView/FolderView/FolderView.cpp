@@ -27,8 +27,9 @@ using namespace Gdiplus;
 void BuildExtensionsList();
 void UpdateWindowContent(HWND hWnd);
 void BuildFilesList(std::filesystem::path const& file_or_folder);
-void PreviousImage(HWND hWnd);
-void NextImage(HWND hWnd);
+bool PreviousImage(HWND hWnd);
+bool NextImage(HWND hWnd);
+void DeleteCurrentImage(HWND hWnd);
 void DrawCurrentImage(HWND hWnd);
 void CalculateScale(HWND hWnd);
 
@@ -155,7 +156,7 @@ Rect CalculateImageRect(HWND hwnd) {
 Rect old_image_rect, new_image_rect;
 
 LPCTSTR pixelFormat(PixelFormat pf) {
-	switch(pf) {
+	switch (pf) {
 	case PixelFormat1bppIndexed:   return TEXT("1bpp Indexed");
 	case PixelFormat4bppIndexed:   return TEXT("4bpp Indexed");
 	case PixelFormat8bppIndexed:   return TEXT("8bpp Indexed");
@@ -216,7 +217,7 @@ void UpdateWindowContent(HWND hWnd)
 
 	header
 		<< files[current_image].c_str();
-		
+
 	GUID	raw_format;
 	image->GetRawFormat(&raw_format);
 
@@ -225,7 +226,7 @@ void UpdateWindowContent(HWND hWnd)
 
 	header
 		<< L" [" << (int)bounds.Width << "x" << (int)bounds.Height;
-	
+
 	if (pixelFormat(pixel_format))
 		header << L" " << pixelFormat(pixel_format);
 
@@ -248,6 +249,254 @@ void UpdateWindowContent(HWND hWnd)
 		old_image.reset();
 
 	InvalidateRect(hWnd, nullptr, TRUE);
+}
+
+class CRecycleBinOps : public IFileOperationProgressSink
+{
+	STDMETHOD(StartOperations)(void) { return S_OK; }
+	STDMETHOD(FinishOperations)(
+		/* [in] */ HRESULT hrResult)
+	{
+		return S_OK;
+	}
+	STDMETHOD(PreRenameItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName)
+	{
+		return E_NOTIMPL;
+	}
+	STDMETHOD(PostRenameItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [string][in] */ __RPC__in LPCWSTR pszNewName,
+		/* [in] */ HRESULT hrRename,
+		/* [in] */ __RPC__in_opt IShellItem* psiNewlyCreated)
+	{
+		return E_NOTIMPL;
+	}
+	STDMETHOD(PreMoveItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PostMoveItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName,
+		/* [in] */ HRESULT hrMove,
+		/* [in] */ __RPC__in_opt IShellItem* psiNewlyCreated)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PreCopyItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PostCopyItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName,
+		/* [in] */ HRESULT hrCopy,
+		/* [in] */ __RPC__in_opt IShellItem* psiNewlyCreated)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PreDeleteItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem)
+	{
+		//See if we're deleting into Recycle Bin
+		if (!(dwFlags & TSF_DELETE_RECYCLE_IF_POSSIBLE))
+		{
+			//We're not! Don't allow to continue
+			return E_ABORT;
+		}
+
+		//Returns S_OK if successful, or an error value otherwise. 
+		//In the case of an error value, the delete operation and all subsequent operations pending from the call to IFileOperation are canceled.
+		return S_OK;
+	}
+
+	STDMETHOD(PostDeleteItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiItem,
+		/* [in] */ HRESULT hrDelete,
+		/* [in] */ __RPC__in_opt IShellItem* psiNewlyCreated)
+	{
+		//Here if you want to see if this item was permanently deleted
+		//do this post-op check:
+		if (psiNewlyCreated == NULL)
+		{
+			//This item was permanently deleted
+			//Note that at this point the file/folder is already gone!
+		}
+
+		//Returns S_OK if successful, or an error value otherwise. 
+		//In the case of an error value, all subsequent operations pending from the call to IFileOperation are canceled.
+		return S_OK;
+	}
+
+	STDMETHOD(PreNewItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PostNewItem)(
+		/* [in] */ DWORD dwFlags,
+		/* [in] */ __RPC__in_opt IShellItem* psiDestinationFolder,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszNewName,
+		/* [string][unique][in] */ __RPC__in_opt LPCWSTR pszTemplateName,
+		/* [in] */ DWORD dwFileAttributes,
+		/* [in] */ HRESULT hrNew,
+		/* [in] */ __RPC__in_opt IShellItem* psiNewItem)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(UpdateProgress)(
+		/* [in] */ UINT iWorkTotal,
+		/* [in] */ UINT iWorkSoFar)
+	{
+		//Provides an estimate of the total amount of work currently done in relation to the total amount of work.
+
+		//For more details on this method and the meaning of these parameters check MSDN:
+		//	http://msdn.microsoft.com/en-us/library/windows/desktop/bb775753(v=vs.85).aspx
+
+		//If this method succeeds, it returns S_OK. Otherwise, it returns an HRESULT error code.
+		return S_OK;
+	}
+
+	STDMETHOD(ResetTimer)(void)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(PauseTimer)(void)
+	{
+		return E_NOTIMPL;
+	}
+
+	STDMETHOD(ResumeTimer)(void)
+	{
+		return E_NOTIMPL;
+	}
+
+
+	ULONG AddRef()
+	{
+		return 2;
+	}
+
+	ULONG Release()
+	{
+		return 1;
+	}
+
+	HRESULT QueryInterface(REFIID riid, void** ppvObj)
+	{
+		if (riid == IID_IFileOperationProgressSink) {
+			*ppvObj = ((IFileOperationProgressSink*)this);
+			return S_OK;
+		}
+
+		return E_NOINTERFACE;
+	}
+
+public:
+	IUnknown* GetInterface(REFIID riid) {
+		IUnknown* result;
+		if (SUCCEEDED(QueryInterface(riid, (void**)&result)))
+			return result;
+
+		return nullptr;
+	}
+};
+
+
+
+BOOL DeleteToRecycleBin(LPCTSTR pStrItemPath)
+{
+	//Delete 'pStrItemPath' item into the Recycle Bin
+	//INFO: This method works on Vista and later OS!
+	//INFO: The item will be deleted only if it can be placed into the Recycle Bin.
+	//'pStrItemPath' = Full item path for a file or a folder to delete
+	//RETURN:
+	//		= TRUE if done
+	BOOL bRes = FALSE;
+
+	if (pStrItemPath && pStrItemPath[0] != 0)
+	{
+		//Make sure it's not a relative path
+		if (!PathIsRelative(pStrItemPath))
+		{
+			//Initialize COM as STA.
+			HRESULT hr = ::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+			if (SUCCEEDED(hr))
+			{
+				//Create the IFileOperation interface
+				CComPtr<IFileOperation> pfo;
+				if (SUCCEEDED(hr = CoCreateInstance(CLSID_FileOperation, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pfo))))
+				{
+					//Set operation flags
+					if (SUCCEEDED(hr = pfo->SetOperationFlags(
+						FOF_ALLOWUNDO |
+						FOF_SILENT |
+						FOF_NOERRORUI | FOFX_EARLYFAILURE |
+						FOF_NO_UI
+					)))
+					{
+						//Create an IShellItem from the supplied path.
+						CComPtr<IShellItem> psiToDelete;
+						if (SUCCEEDED(hr = SHCreateItemFromParsingName(pStrItemPath, NULL, IID_PPV_ARGS(&psiToDelete))))
+						{
+							//Initialize our class with the IFileOperationProgressSink implementation
+							CRecycleBinOps* pThis = new CRecycleBinOps();
+
+							IFileOperationProgressSink* pSink = (IFileOperationProgressSink*)pThis->GetInterface(&IID_IFileOperationProgressSink);
+							if (pSink)
+							{
+								//Add the operation
+								if (SUCCEEDED(hr = pfo->DeleteItem(psiToDelete, pSink)))
+								{
+									//And perform the operation
+									if (SUCCEEDED(hr = pfo->PerformOperations()))
+									{
+										//Done
+										bRes = TRUE;
+									}
+								}
+							}
+
+							delete pThis;
+							pThis = NULL;
+						}
+					}
+				}
+
+				//Unit COM
+				::CoUninitialize();
+			}
+		}
+	}
+
+	return bRes;
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -302,6 +551,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			current_image = files.size() - 1;
 			DrawCurrentImage(hWnd);
 			return 0;
+
+		case VK_DELETE:
+			DeleteCurrentImage(hWnd);
+			break;
 
 		case VK_ESCAPE:
 			PostQuitMessage(0);
@@ -589,35 +842,37 @@ void DrawCurrentImage(HWND hWnd) {
 	UpdateWindowContent(hWnd);
 }
 
-void PreviousImage(HWND hWnd)
+bool PreviousImage(HWND hWnd)
 {
 	if (block_changing_of_current_image)
-		return;
+		return false;
 
 	if (current_image == 0) {
 		current_image = 0;
-		return;
+		return false;
 	}
 
 	current_image--;
 	image_shift.reset();
 
 	DrawCurrentImage(hWnd);
+	return true;
 }
 
-void NextImage(HWND hWnd)
+bool NextImage(HWND hWnd)
 {
 	if (block_changing_of_current_image)
-		return;
+		return false;
 
 	if (current_image + 1 >= files.size()) {
-		return;
+		return false;
 	}
 
 	current_image++;
 	image_shift.reset();
 
 	DrawCurrentImage(hWnd);
+	return true;
 }
 
 std::vector<std::wstring> parse_command_line()
