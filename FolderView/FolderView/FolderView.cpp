@@ -11,6 +11,7 @@
 #include <gdiplus.h>
 #include <shlobj.h>
 #include <atlbase.h>
+#include <VersionHelpers.h>
 using namespace Gdiplus;
 #pragma comment (lib,"Gdiplus.lib")
 #undef min
@@ -21,21 +22,26 @@ using namespace Gdiplus;
 #include <filesystem>
 #include <string>
 #include <sstream>
+#include <thread>
+#include <atomic>
 
 #include "AlmostEquals.h"
 
 void BuildExtensionsList();
-void UpdateWindowContent(HWND hWnd);
 void BuildFilesList(std::filesystem::path const& file_or_folder);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
-void DrawCurrentImage(HWND hWnd);
-void CalculateScale(HWND hWnd);
+void DrawImage(HWND hWnd, Bitmap& image, Graphics* php = nullptr);
+void SetCurrentImage(HWND hWnd, int imageIndex);
+float CalculateScale(HWND hWnd, Bitmap& image);
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
 
 std::vector<std::tuple<std::unique_ptr<CachedBitmap>, int, int>> bitmaps;
+
+std::atomic<bool>				abort_draw_image(false);
+std::unique_ptr<std::thread>	current_drawing_thread;
 
 size_t current_image = 0;
 bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
@@ -129,10 +135,10 @@ void BuildExtensionsList()
 	free(decoders);
 }
 
-Rect CalculateImageRect(HWND hwnd) {
+Rect CalculateImageRect(HWND hwnd, Bitmap& image, float scale) {
 	RectF	imageBounds;
 	Unit	imageUnits;
-	image->GetBounds(&imageBounds, &imageUnits);
+	image.GetBounds(&imageBounds, &imageUnits);
 
 	RECT	clientRect;
 	GetClientRect(hwnd, &clientRect);
@@ -152,10 +158,8 @@ Rect CalculateImageRect(HWND hwnd) {
 	return Rect(Point(x, y), Size(iw, ih));
 }
 
-Rect old_image_rect, new_image_rect;
-
 LPCTSTR pixelFormat(PixelFormat pf) {
-	switch(pf) {
+	switch (pf) {
 	case PixelFormat1bppIndexed:   return TEXT("1bpp Indexed");
 	case PixelFormat4bppIndexed:   return TEXT("4bpp Indexed");
 	case PixelFormat8bppIndexed:   return TEXT("8bpp Indexed");
@@ -189,65 +193,6 @@ LPCTSTR getFormat(GUID& formatGuid) {
 	if (IsEqualGUID(formatGuid, ImageFormatWEBP)) return TEXT("WEBP");
 
 	return nullptr;
-}
-
-void UpdateWindowContent(HWND hWnd)
-{
-	std::unique_ptr<Bitmap> old_image;
-
-	if (image) {
-		old_image_rect = CalculateImageRect(hWnd);
-	}
-
-	old_image.swap(image);
-
-	image.reset(Bitmap::FromFile(files[current_image].c_str()));
-
-	std::wstringstream	header;
-
-	CalculateScale(hWnd);
-
-	WINDOWPLACEMENT wpl;
-	GetWindowPlacement(hWnd, &wpl);
-
-	auto pixel_format = image->GetPixelFormat();
-	SizeF bounds;
-	image->GetPhysicalDimension(&bounds);
-
-	header
-		<< files[current_image].c_str();
-		
-	GUID	raw_format;
-	image->GetRawFormat(&raw_format);
-
-	if (getFormat(raw_format))
-		header << L" " << getFormat(raw_format);
-
-	header
-		<< L" [" << (int)bounds.Width << "x" << (int)bounds.Height;
-	
-	if (pixelFormat(pixel_format))
-		header << L" " << pixelFormat(pixel_format);
-
-	header
-		<< L"] "
-		<< std::fixed << std::setprecision(0) << scale * 100.0f << L"%";
-
-	SetWindowText(hWnd, header.str().c_str());
-
-	if (wpl.showCmd != SW_MAXIMIZE) {
-		RECT rect{ 0, 0, bounds.Width, bounds.Height };
-		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
-	}
-
-	new_image_rect = CalculateImageRect(hWnd);
-	if (!old_image)
-		old_image_rect = new_image_rect;
-	else
-		old_image.reset();
-
-	InvalidateRect(hWnd, nullptr, TRUE);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -291,7 +236,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 
 			current_image = 0;
-			DrawCurrentImage(hWnd);
+			SetCurrentImage(hWnd, current_image);
 			return 0;
 
 		case VK_NUMPAD1:
@@ -300,7 +245,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 
 			current_image = files.size() - 1;
-			DrawCurrentImage(hWnd);
+			SetCurrentImage(hWnd, current_image);
 			return 0;
 
 		case VK_ESCAPE:
@@ -337,7 +282,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case '0':
 		case VK_MULTIPLY:
 			if (AlmostEquals(scale, 1.0f)) {
-				CalculateScale(hWnd);
+				scale = CalculateScale(hWnd, *image);
 				if (AlmostEquals(scale, 1.0f))
 					return 0;
 			}
@@ -443,108 +388,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		ReleaseCapture();
 		return 0;
 
-	case WM_ERASEBKGND: {
-		Graphics hp((HDC)wParam);
-
-		RECT	clientRect;
-		GetClientRect(hWnd, &clientRect);
-
-		Rect overlap;
-
-		if (!image) {
-			Rect r0(clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
-
-			SolidBrush f0(Color::DarkGray);
-
-			hp.FillRectangle(&f0, r0);
-
-			return 1L;
-		}
-
-		if (Rect::Intersect(overlap, new_image_rect, old_image_rect)) {
-			int oix = clientRect.left;
-			int oiy = clientRect.top;
-			int oixw = clientRect.right;
-			int oiyh = clientRect.bottom;
-
-			int ovx = overlap.X;
-			int ovy = overlap.Y;
-			int ovxw = overlap.X + overlap.Width;
-			int ovyh = overlap.Y + overlap.Height;
-
-			Rect r0(oix, oiy, oixw - oix, ovy - oiy);
-			Rect r1(oix, ovy, ovx - oix, ovyh - ovy);
-			Rect r2(ovxw, ovy, oixw - ovxw, ovyh - ovy);
-			Rect r3(oix, ovyh, oixw - oix, oiyh - ovyh);
-
-			SolidBrush f0(Color::DarkGray);
-			SolidBrush f1(Color::DarkGray);
-			SolidBrush f2(Color::DarkGray);
-			SolidBrush f3(Color::DarkGray);
-
-			hp.FillRectangle(&f0, r0);
-			hp.FillRectangle(&f1, r1);
-			hp.FillRectangle(&f2, r2);
-			hp.FillRectangle(&f3, r3);
-		}
-
-		return 1L;
-	}
-
 	case WM_PAINT:
 	{
-		if (!image)
-			UpdateWindowContent(hWnd);
-
 		PAINTSTRUCT  ps;
 		HDC          hdc = BeginPaint(hWnd, &ps);
-
-		auto image_rect = CalculateImageRect(hWnd);
-
 		Graphics hp(hdc);
 
-		CachedBitmap* cached_bitmap = std::get<0>(bitmaps[current_image]).get();
-
-		int cached_w = std::get<1>(bitmaps[current_image]);
-		int cached_h = std::get<2>(bitmaps[current_image]);
-
-		if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
-		{
-			Bitmap  b(image_rect.Width, image_rect.Height);
-			std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
-
-			if (image_shift)
-				g->TranslateTransform(image_shift->x, image_shift->y);
-
-			g->ScaleTransform(scale, scale);
-
-			RectF	imageBounds;
-			Unit	imageUnits;
-			image->GetBounds(&imageBounds, &imageUnits);
-
-			g->DrawImage(image.get(), 0.0f, 0.0f, imageBounds.Width, imageBounds.Height);
-
-			g.reset();
-
-			cached_bitmap = new CachedBitmap(&b, &hp);
-
-			cached_h = image_rect.Height;
-			cached_w = image_rect.Width;
-
-			bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
-
-			const int cache_epsilon = 20; // сколько в окресности держать кешированных изображений
-			for (int i = 0; i < (int)current_image - cache_epsilon; i++) {
-				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
-			}
-			for (int i = current_image + cache_epsilon; i < bitmaps.size(); i++) {
-				bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
-			}
-		}
-
-		hp.DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
+		DrawImage(hWnd, *image, &hp);
 
 		EndPaint(hWnd, &ps);
+
 		return 0;
 	}
 
@@ -556,18 +409,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
 
-void CalculateScale(HWND hWnd) {
+float CalculateScale(HWND hWnd, Bitmap& image) {
 	WINDOWPLACEMENT wpl;
 	GetWindowPlacement(hWnd, &wpl);
 
-	scale = 1.0f;
+	float scale = 1.0f;
 
 	if (wpl.showCmd != SW_MAXIMIZE)
-		return;
+		return 1.0f;
 
 	RectF	imageBounds;
 	Unit	imageUnits;
-	image->GetBounds(&imageBounds, &imageUnits);
+	image.GetBounds(&imageBounds, &imageUnits);
 
 	RECT	clientRect;
 	GetClientRect(hWnd, &clientRect);
@@ -583,10 +436,464 @@ void CalculateScale(HWND hWnd) {
 		scale /= imageBounds.Height * scale / (float)ch;
 		imageBounds.Height = ch;
 	}
+
+	return scale;
 }
 
-void DrawCurrentImage(HWND hWnd) {
-	UpdateWindowContent(hWnd);
+void EraseOldImageBackground(HWND hWnd, Rect const& old_image_rect, Rect const& new_image_rect)
+{
+	Graphics	hp(hWnd);
+
+	RECT	clientRect;
+	GetClientRect(hWnd, &clientRect);
+
+	Rect overlap;
+
+	if (!image) {
+		Rect r0(clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
+
+		SolidBrush f0(Color::DarkGray);
+
+		hp.FillRectangle(&f0, r0);
+		hp.Flush();
+
+		return;
+	}
+
+	if (Rect::Intersect(overlap, new_image_rect, old_image_rect)) {
+		int oix = clientRect.left;
+		int oiy = clientRect.top;
+		int oixw = clientRect.right;
+		int oiyh = clientRect.bottom;
+
+		int ovx = overlap.X;
+		int ovy = overlap.Y;
+		int ovxw = overlap.X + overlap.Width;
+		int ovyh = overlap.Y + overlap.Height;
+
+		Rect r0(oix, oiy, oixw - oix, ovy - oiy);
+		Rect r1(oix, ovy, ovx - oix, ovyh - ovy);
+		Rect r2(ovxw, ovy, oixw - ovxw, ovyh - ovy);
+		Rect r3(oix, ovyh, oixw - oix, oiyh - ovyh);
+
+		SolidBrush f0(Color::DarkGray);
+		SolidBrush f1(Color::DarkGray);
+		SolidBrush f2(Color::DarkGray);
+		SolidBrush f3(Color::DarkGray);
+
+		hp.FillRectangle(&f0, r0);
+		hp.FillRectangle(&f1, r1);
+		hp.FillRectangle(&f2, r2);
+		hp.FillRectangle(&f3, r3);
+	}
+
+	hp.Flush();
+}
+
+void UpdateWindowTitle(HWND hWnd, Bitmap& image, float scale)
+{
+	std::wstringstream	header;
+
+	auto pixel_format = image.GetPixelFormat();
+	SizeF bounds;
+	image.GetPhysicalDimension(&bounds);
+
+	header
+		<< files[current_image].c_str();
+
+	GUID	raw_format;
+	image.GetRawFormat(&raw_format);
+
+	if (getFormat(raw_format))
+		header << L" " << getFormat(raw_format);
+
+	header
+		<< L" [" << (int)bounds.Width << "x" << (int)bounds.Height;
+
+	if (pixelFormat(pixel_format))
+		header << L" " << pixelFormat(pixel_format);
+
+	header
+		<< L"] "
+		<< std::fixed << std::setprecision(0) << scale * 100.0f << L"%";
+
+	SetWindowText(hWnd, header.str().c_str());
+}
+
+void SetCurrentImage0(HWND hWnd, int imageIndex) {
+	image_shift.reset();
+
+	image.reset(Bitmap::FromFile(files[current_image].c_str()));
+
+	scale = CalculateScale(hWnd, *image);
+	UpdateWindowTitle(hWnd, *image, scale);
+
+	WINDOWPLACEMENT wpl;
+	GetWindowPlacement(hWnd, &wpl);
+
+	if (wpl.showCmd != SW_MAXIMIZE) {
+		SizeF bounds;
+		image->GetPhysicalDimension(&bounds);
+
+		RECT rect{ 0, 0, bounds.Width, bounds.Height };
+		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
+	}
+}
+
+void SetCurrentImage(HWND hWnd, int imageIndex) {
+	std::unique_ptr<Bitmap> old_image;
+
+	old_image.swap(image);
+	auto old_scale = scale;
+
+	SetCurrentImage0(hWnd, imageIndex);
+
+	if (old_image)
+		EraseOldImageBackground(hWnd, CalculateImageRect(hWnd, *old_image, old_scale), CalculateImageRect(hWnd, *image, scale));
+
+	DrawImage(hWnd, *image);
+}
+
+namespace Thumbnails {
+	class Internals {
+	private:
+		static PropertyItem* GetPropertyItemFromImage(Gdiplus::Image* bm, PROPID propId) {
+			UINT itemSize = bm->GetPropertyItemSize(propId);
+			if (!itemSize) {
+				return 0;
+			}
+			PropertyItem* item = reinterpret_cast<PropertyItem*>(malloc(itemSize));
+			if (bm->GetPropertyItem(propId, itemSize, item) != Ok) {
+				free(item);
+				return 0;
+			}
+			return item;
+		}
+
+		static UINT VoidToInt(void* data, unsigned int size) {
+			switch (size) {
+			case 8:
+				return *reinterpret_cast<UINT*>(data);
+			case 4:
+				return *reinterpret_cast<DWORD*>(data);
+			case 2:
+				return *reinterpret_cast<WORD*>(data);
+			default:
+				return *reinterpret_cast<BYTE*>(data);
+			}
+		}
+
+		typedef IStream* (STDAPICALLTYPE* SHCreateMemStreamFuncType)(const BYTE* pInit, UINT cbInit);
+		static SHCreateMemStreamFuncType SHCreateMemStreamFunc;
+
+		static Gdiplus::Bitmap* BitmapFromMemory(BYTE* data, unsigned int imageSize) {
+			if (IsWindowsVistaOrGreater()) {
+				if (!SHCreateMemStreamFunc) {
+					HMODULE lib = LoadLibrary(_T("Shlwapi.dll"));
+					SHCreateMemStreamFunc = reinterpret_cast<SHCreateMemStreamFuncType>(GetProcAddress(lib, "SHCreateMemStream"));
+					if (!SHCreateMemStreamFunc) {
+						return 0;
+					}
+				}
+
+				Gdiplus::Bitmap* bitmap;
+				IStream* pStream = SHCreateMemStreamFunc(data, imageSize);
+				if (pStream) {
+					bitmap = Gdiplus::Bitmap::FromStream(pStream);
+					pStream->Release();
+					if (bitmap) {
+						if (bitmap->GetLastStatus() == Gdiplus::Ok) {
+							return bitmap;
+						}
+						delete bitmap;
+					}
+				}
+			}
+			else {
+				HGLOBAL buffer = ::GlobalAlloc(GMEM_MOVEABLE, imageSize);
+				if (buffer) {
+					void* pBuffer = ::GlobalLock(buffer);
+					if (pBuffer) {
+						Gdiplus::Bitmap* bitmap;
+						CopyMemory(pBuffer, data, imageSize);
+
+						IStream* pStream = NULL;
+						if (::CreateStreamOnHGlobal(buffer, FALSE, &pStream) == S_OK) {
+							bitmap = Gdiplus::Bitmap::FromStream(pStream);
+							pStream->Release();
+							if (bitmap) {
+								if (bitmap->GetLastStatus() == Gdiplus::Ok) {
+									return bitmap;
+								}
+
+								delete bitmap;
+							}
+						}
+						::GlobalUnlock(buffer);
+					}
+					::GlobalFree(buffer);
+				}
+			}
+
+			return 0;
+		}
+
+		static Gdiplus::Size AdaptProportionalSize(const Gdiplus::Size& szMax, const Gdiplus::Size& szReal)
+		{
+			int nWidth;
+			int nHeight;
+			double sMaxRatio;
+			double sRealRatio;
+
+			if (szMax.Width < 1 || szMax.Height < 1 || szReal.Width < 1 || szReal.Height < 1)
+				return Size();
+
+			sMaxRatio = szMax.Width / static_cast<double>(szMax.Height);
+			sRealRatio = szReal.Width / static_cast<double>(szReal.Height);
+
+			if (sMaxRatio < sRealRatio) {
+				nWidth = std::min(szMax.Width, szReal.Width);
+				nHeight = static_cast<int>(round(nWidth / sRealRatio));
+			}
+			else {
+				nHeight = std::min(szMax.Height, szReal.Height);
+				nWidth = static_cast<int>(round(nHeight * sRealRatio));
+			}
+
+			return Size(nWidth, nHeight);
+		}
+
+	public:
+		static Gdiplus::Bitmap* GetThumbnail(Gdiplus::Image* bm)
+		{
+			UINT size = bm->GetPropertyItemSize(PropertyTagThumbnailData);
+			if (!size)
+				return nullptr;
+
+			// Loading thumbnail from EXIF data (fast)
+			enum ThumbCompression { ThumbCompressionJPEG, ThumbCompressionRGB, ThumbCompressionYCbCr, ThumbCompressionUnknown }
+			compression = ThumbCompressionJPEG;
+
+			PropertyItem* thumbnailFormatItem = GetPropertyItemFromImage(bm, PropertyTagThumbnailFormat);
+			if (thumbnailFormatItem) {
+				UINT format = VoidToInt(thumbnailFormatItem->value, thumbnailFormatItem->length);
+				if (format == 0) {
+					compression = ThumbCompressionRGB;
+				}
+				else if (format == 1) {
+					compression = ThumbCompressionJPEG;
+				}
+				else {
+					compression = ThumbCompressionUnknown;
+				}
+				free(thumbnailFormatItem);
+			}
+			else {
+				PropertyItem* compressionItem = GetPropertyItemFromImage(bm, PropertyTagThumbnailCompression);
+				if (compressionItem) {
+					WORD compressionTag = *reinterpret_cast<WORD*>(compressionItem->value);
+					if (compressionTag == 1) {
+						compression = ThumbCompressionRGB;
+						PropertyItem* photometricInterpretationItem = GetPropertyItemFromImage(bm, PropertyTagPhotometricInterp);
+						if (photometricInterpretationItem) {
+							WORD photoMetricInterpretationTag = VoidToInt(photometricInterpretationItem->value, photometricInterpretationItem->length);
+							free(photometricInterpretationItem);
+							if (photoMetricInterpretationTag == 6) {
+								compression = ThumbCompressionYCbCr;
+							}
+						}
+
+					}
+					else if (compressionTag == 6) {
+						compression = ThumbCompressionJPEG;
+					}
+
+					free(compressionItem);
+				}
+			}
+
+			int originalThumbWidth = 0, originalThumbHeight = 0;
+			if (compression == ThumbCompressionJPEG || compression == ThumbCompressionRGB) {
+				PropertyItem* thumbDataItem = GetPropertyItemFromImage(bm, PropertyTagThumbnailData);
+				if (thumbDataItem) {
+					if (compression == ThumbCompressionJPEG) {
+						Bitmap* src = BitmapFromMemory(reinterpret_cast<BYTE*>(thumbDataItem->value), thumbDataItem->length);
+
+						if (src) {
+							free(thumbDataItem);
+							return src;
+						}
+					}
+					else if (compression == ThumbCompressionRGB) {
+						PropertyItem* widthItem = GetPropertyItemFromImage(bm, PropertyTagThumbnailImageWidth);
+						if (widthItem) {
+							originalThumbWidth = VoidToInt(widthItem->value, widthItem->length);
+							free(widthItem);
+						}
+						PropertyItem* heightItem = GetPropertyItemFromImage(bm, PropertyTagThumbnailImageHeight);
+						if (heightItem) {
+							originalThumbHeight = VoidToInt(heightItem->value, heightItem->length);
+							free(heightItem);
+						}
+						if (originalThumbWidth && originalThumbHeight) {
+							BITMAPINFOHEADER bih;
+							memset(&bih, 0, sizeof(bih));
+							bih.biSize = sizeof(bih);
+							bih.biWidth = originalThumbWidth;
+							bih.biHeight = -originalThumbHeight;
+							bih.biPlanes = 1;
+							bih.biBitCount = 24;
+
+							BITMAPINFO bi;
+							memset(&bi, 0, sizeof(bi));
+							bi.bmiHeader = bih;
+
+							BYTE* data = reinterpret_cast<BYTE*>(thumbDataItem->value);
+							BYTE temp;
+							// Convert RGB to BGR
+							for (unsigned int offset = 0; offset < thumbDataItem->length; offset += 3) {
+								temp = data[offset];
+								data[offset] = data[offset + 2];
+								data[offset + 2] = temp;
+							}
+							Bitmap* src = new Bitmap(&bi, thumbDataItem->value);
+
+							if (src->GetLastStatus() == Ok) {
+								free(thumbDataItem);
+								return src;
+							}
+
+							delete src;
+						}
+
+					}
+					else {
+						// other type of compression not implemented
+					}
+					free(thumbDataItem);
+				}
+			}
+
+			return nullptr;
+		}
+
+		// Based on original method from http://danbystrom.se/2009/01/05/imagegetthumbnailimage-and-beyond/
+		static Gdiplus::Bitmap* BuildThumbnail(Gdiplus::Image* bm, int width, int height, Gdiplus::Size* realSize = 0) {
+			using namespace Gdiplus;
+			if (realSize) {
+				realSize->Width = bm->GetWidth();
+				realSize->Height = bm->GetHeight();
+			}
+			Size sz = AdaptProportionalSize(Size(width, height), Size(bm->GetWidth(), bm->GetHeight()));
+			Bitmap* res = new Bitmap(sz.Width, sz.Height);
+			Graphics gr(res);
+
+			gr.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+			UINT size = bm->GetPropertyItemSize(PropertyTagThumbnailData);
+
+			Bitmap* src = GetThumbnail(bm);
+			if (src) {
+				gr.DrawImage(src, 0, 0, sz.Width, sz.Height);
+				delete src;
+				return res;
+			}
+
+			// Fallback - Load full image and draw it  (slow)
+			gr.DrawImage(bm, 0, 0, sz.Width, sz.Height);
+
+			return res;
+		}
+	};
+
+	Gdiplus::Bitmap* BuildThumbnail(Gdiplus::Image& bm, int width, int height, Gdiplus::Size* realSize = 0) {
+		return Internals::BuildThumbnail(&bm, width, height, realSize);
+	}
+
+	Gdiplus::Bitmap* GetThumbnail(Gdiplus::Image& bm) {
+		return Internals::GetThumbnail(&bm);
+	}
+
+
+	Thumbnails::Internals::SHCreateMemStreamFuncType Thumbnails::Internals::SHCreateMemStreamFunc = 0;
+}
+
+void DrawImage(HWND hWnd, Bitmap& image, Graphics* php) {
+	CachedBitmap* cached_bitmap = std::get<0>(bitmaps[current_image]).get();
+
+	int cached_w = std::get<1>(bitmaps[current_image]);
+	int cached_h = std::get<2>(bitmaps[current_image]);
+
+	auto image_rect = CalculateImageRect(hWnd, image, scale);
+	if (php == nullptr) {
+		if (current_drawing_thread) {
+			abort_draw_image = true;
+			current_drawing_thread->join();
+		}
+		abort_draw_image = false;
+
+		current_drawing_thread.reset(
+			new std::thread([image_rect, hWnd, &image]() {
+				SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+				Graphics hp(hWnd);
+
+				auto thm = Thumbnails::GetThumbnail(image);
+				if (thm) {
+					hp.DrawImage(thm, image_rect);
+					hp.Flush();
+					delete thm;
+				}
+
+				if (abort_draw_image)
+					return;
+
+				hp.DrawImage(&image, image_rect);
+				hp.Flush();
+
+				}));
+
+		current_drawing_thread->join();
+		current_drawing_thread.reset();
+
+		return;
+	}
+
+	if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
+	{
+		Bitmap  b(image_rect.Width, image_rect.Height);
+		std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
+
+		if (image_shift)
+			g->TranslateTransform(image_shift->x, image_shift->y);
+
+		g->ScaleTransform(scale, scale);
+
+		RectF	imageBounds;
+		Unit	imageUnits;
+		image.GetBounds(&imageBounds, &imageUnits);
+
+		g->DrawImage(&image, 0.0f, 0.0f, imageBounds.Width, imageBounds.Height);
+
+		g.reset();
+
+		cached_bitmap = new CachedBitmap(&b, php);
+
+		cached_h = image_rect.Height;
+		cached_w = image_rect.Width;
+
+		bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
+
+		const int cache_epsilon = 20; // сколько в окресности держать кешированных изображений
+		for (int i = 0; i < (int)current_image - cache_epsilon; i++) {
+			bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+		}
+		for (int i = current_image + cache_epsilon; i < bitmaps.size(); i++) {
+			bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
+		}
+	}
+
+	php->DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
 }
 
 void PreviousImage(HWND hWnd)
@@ -600,9 +907,8 @@ void PreviousImage(HWND hWnd)
 	}
 
 	current_image--;
-	image_shift.reset();
 
-	DrawCurrentImage(hWnd);
+	SetCurrentImage(hWnd, current_image);
 }
 
 void NextImage(HWND hWnd)
@@ -615,9 +921,8 @@ void NextImage(HWND hWnd)
 	}
 
 	current_image++;
-	image_shift.reset();
 
-	DrawCurrentImage(hWnd);
+	SetCurrentImage(hWnd, current_image);
 }
 
 std::vector<std::wstring> parse_command_line()
@@ -663,6 +968,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	auto root = parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path();
 	BuildFilesList(root);
 
+	HBRUSH background = CreateSolidBrush(Gdiplus::Color(Gdiplus::Color::DarkGray).ToCOLORREF());
+
 	WNDCLASSEXW wndClass;
 	wndClass.cbSize = sizeof(wndClass);
 	wndClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -672,7 +979,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	wndClass.hInstance = hInstance;
 	wndClass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
 	wndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wndClass.hbrBackground = nullptr;
+	wndClass.hbrBackground = background;
 	wndClass.lpszMenuName = nullptr;
 	wndClass.lpszClassName = TEXT("FolderView");
 	wndClass.hIconSm = nullptr;
@@ -693,6 +1000,9 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		NULL);                    // creation parameters
 
 	ShowWindow(hWnd, SW_MAXIMIZE);
+
+	SetCurrentImage0(hWnd, 0);
+
 	UpdateWindow(hWnd);
 
 	while (GetMessage(&msg, NULL, 0, 0))
@@ -701,9 +1011,17 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		DispatchMessage(&msg);
 	}
 
+	if (current_drawing_thread)
+	{
+		abort_draw_image = true;
+		current_drawing_thread->join();
+	}
+
 	image.reset();
 
 	bitmaps.clear();
+
+	DeleteObject(background);
 
 	GdiplusShutdown(gdiplusToken);
 
