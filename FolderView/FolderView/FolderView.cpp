@@ -122,10 +122,18 @@ void BuildExtensionsList()
 	Gdiplus::GetImageDecodersSize(&decoders_count, &decoders_size);
 
 	auto decoders = reinterpret_cast<ImageCodecInfo*>(malloc(decoders_size));
+	if (decoders == nullptr)
+		throw std::bad_alloc();
+
 	Gdiplus::GetImageDecoders(decoders_count, decoders_size, decoders);
 
-	for (int i = 0; i < decoders_count; i++) {
-		std::wistringstream f(decoders[i].FilenameExtension);
+	for (size_t i = 0; i < decoders_count; i++) {
+		if((i + 1) * sizeof(decoders[0]) >= decoders_size) {
+			free(decoders);
+			throw std::exception();
+		}
+
+		std::wistringstream f(std::wstring(decoders[i].FilenameExtension));
 		std::wstring s;
 		while (std::getline(f, s, L';')) {
 			extensions.push_back(s.c_str() + 1);
@@ -225,6 +233,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (GetKeyState(VK_CONTROL) & 0x8000)
 				goto scale_up;
 
+			[[fallthrough]];
 		case VK_NUMPAD8:
 		case VK_PRIOR:
 			PreviousImage(hWnd);
@@ -256,6 +265,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (GetKeyState(VK_CONTROL) & 0x8000)
 				goto scale_down;
 
+			[[fallthrough]];
 		case VK_NUMPAD2:
 		case VK_NEXT:
 			NextImage(hWnd);
@@ -410,7 +420,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 } // WndProc
 
 float CalculateScale(HWND hWnd, Bitmap& image) {
-	WINDOWPLACEMENT wpl;
+	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
 
 	float scale = 1.0f;
@@ -528,7 +538,7 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 	scale = CalculateScale(hWnd, *image);
 	UpdateWindowTitle(hWnd, *image, scale);
 
-	WINDOWPLACEMENT wpl;
+	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
 
 	if (wpl.showCmd != SW_MAXIMIZE) {
@@ -680,7 +690,8 @@ std::vector<std::wstring> parse_command_line()
 
 INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 {
-	OleInitialize(NULL);
+	if (OleInitialize(NULL) != S_OK)
+		return -1;
 
 	HWND                hWnd;
 	MSG                 msg;
