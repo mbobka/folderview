@@ -711,7 +711,8 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	HBRUSH background = CreateSolidBrush(Gdiplus::Color(Gdiplus::Color::DarkGray).ToCOLORREF());
 
-	WNDCLASSEXW wndClass;
+	WNDCLASSEXW wndClass {};
+
 	wndClass.cbSize = sizeof(wndClass);
 	wndClass.style = CS_HREDRAW | CS_VREDRAW;
 	wndClass.lpfnWndProc = WndProc;
