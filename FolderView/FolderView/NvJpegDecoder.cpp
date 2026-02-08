@@ -1,5 +1,4 @@
 #include "ImageDecoder.h"
-#include <fstream>
 #include <algorithm>
 
 #ifdef HAS_NVJPEG
@@ -60,17 +59,36 @@ public:
     }
 
     std::unique_ptr<DecodedImage> Decode(const wchar_t* path) override {
-        // Читаем файл в память
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file) return nullptr;
+        HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return nullptr;
 
-        auto fileSize = file.tellg();
-        file.seekg(0);
-        std::vector<unsigned char> jpegData(static_cast<size_t>(fileSize));
-        file.read(reinterpret_cast<char*>(jpegData.data()), fileSize);
-        file.close();
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart == 0) {
+            CloseHandle(hFile);
+            return nullptr;
+        }
 
-        return DecodeFromMemory(jpegData.data(), jpegData.size(), path);
+        HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hMapping) {
+            CloseHandle(hFile);
+            return nullptr;
+        }
+
+        auto* mapped = static_cast<const uint8_t*>(MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0));
+        if (!mapped) {
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            return nullptr;
+        }
+
+        auto result = DecodeFromMemory(mapped, static_cast<size_t>(fileSize.QuadPart), path);
+
+        UnmapViewOfFile(mapped);
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+
+        return result;
     }
 
     std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) override {
