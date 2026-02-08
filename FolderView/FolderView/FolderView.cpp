@@ -43,7 +43,8 @@ bool IsZipFile(const std::filesystem::path& path);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
 void DrawImage(HWND hWnd);
-void SetCurrentImage(HWND hWnd, int imageIndex);
+void UpdateWindowTitle(HWND hWnd);
+void SetCurrentImage(HWND hWnd);
 float CalculateScale(HWND hWnd, int width, int height);
 
 // Direct2D globals
@@ -65,8 +66,8 @@ float scale = 1.0f;
 
 static POINTS ptsBegin;        // beginning point 
 
-bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
-	for (auto extension : extensions) {
+static bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
+	for (auto& extension : extensions) {
 		if (lstrcmpi(file.extension().c_str(), extension.c_str()) == 0)
 			return true;
 	}
@@ -74,7 +75,7 @@ bool is_file_has_right_extension_for_us(std::filesystem::path const& file) {
 	return false;
 }
 
-HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
+static HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
 {
 	*ppv = NULL;
 	HRESULT hr;
@@ -93,7 +94,7 @@ HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
 	return hr;
 }
 
-void BuildFilesList(std::filesystem::path const& file_or_folder)
+static void BuildFilesList(std::filesystem::path const& file_or_folder)
 {
 	std::filesystem::directory_entry entry(file_or_folder);
 	if (!entry.exists()) {
@@ -111,7 +112,7 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 		files_root = entry.path().lexically_normal().parent_path();
 	}
 
-	for (auto entryx : std::filesystem::directory_iterator(files_root))
+	for (auto& entryx : std::filesystem::directory_iterator(files_root))
 	{
 		if (!entryx.is_regular_file())
 			continue;
@@ -125,17 +126,21 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 		files.push_back(entryx.path());
 	}
 
+	std::sort(files.begin(), files.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return lstrcmpiW(a.c_str(), b.c_str()) < 0;
+		});
+
 	decodedImagesCache.resize(files.size());
 }
 
-bool IsZipFile(const std::filesystem::path& path)
+static bool IsZipFile(const std::filesystem::path& path)
 {
 	std::wstring ext = path.extension().wstring();
 	std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
 	return ext == L".zip";
 }
 
-void BuildFilesListFromZip(const std::wstring& zipPath)
+static void BuildFilesListFromZip(const std::wstring& zipPath)
 {
 	auto& zipManager = ZipArchiveManager::Instance();
 	
@@ -154,6 +159,10 @@ void BuildFilesListFromZip(const std::wstring& zipPath)
 		files.push_back(std::filesystem::path(imageName));
 	}
 
+	std::sort(files.begin(), files.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return lstrcmpiW(a.c_str(), b.c_str()) < 0;
+		});
+
 	decodedImagesCache.resize(files.size());
 
 	wchar_t msg[256];
@@ -161,7 +170,7 @@ void BuildFilesListFromZip(const std::wstring& zipPath)
 	OutputDebugStringW(msg);
 }
 
-void BuildExtensionsList()
+static void BuildExtensionsList()
 {
 	// Список поддерживаемых расширений (WIC поддерживает их все)
 	extensions.push_back(L".jpg");
@@ -177,7 +186,7 @@ void BuildExtensionsList()
 	extensions.push_back(L".heic");
 }
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 
 	switch (message)
@@ -219,7 +228,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 
 			current_image = 0;
-			SetCurrentImage(hWnd, current_image);
+			SetCurrentImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD1:
@@ -228,7 +237,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 
 			current_image = files.size() - 1;
-			SetCurrentImage(hWnd, current_image);
+			SetCurrentImage(hWnd);
 			return 0;
 
 		case VK_ESCAPE:
@@ -251,15 +260,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 
 			scale *= 2.0f;
+			UpdateWindowTitle(hWnd);
 			InvalidateRect(hWnd, NULL, FALSE);
 			return 0;
 
 		case VK_SUBTRACT:
 		scale_down:
 			if (scale < 0.00001f)
-				return 0;
+			return 0;
 
 			scale *= 0.5f;
+			UpdateWindowTitle(hWnd);
 			InvalidateRect(hWnd, NULL, TRUE);
 			return 0;
 
@@ -273,6 +284,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			else
 				scale = 1.0f;
 
+			UpdateWindowTitle(hWnd);
 			InvalidateRect(hWnd, NULL, TRUE);
 			return 0;
 
@@ -406,7 +418,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
 
-float CalculateScale(HWND hWnd, int imgWidth, int imgHeight) {
+static float CalculateScale(HWND hWnd, int imgWidth, int imgHeight) {
 	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
 
@@ -432,8 +444,13 @@ float CalculateScale(HWND hWnd, int imgWidth, int imgHeight) {
 	return scale;
 }
 
-void UpdateWindowTitle(HWND hWnd, const DecodedImage& image, float scale)
+static void UpdateWindowTitle(HWND hWnd)
 {
+	if (!decodedImagesCache[current_image])
+		return;
+
+	const DecodedImage& image = *decodedImagesCache[current_image];
+
 	std::wstringstream header;
 
 	if (g_isZipMode) {
@@ -457,7 +474,7 @@ void UpdateWindowTitle(HWND hWnd, const DecodedImage& image, float scale)
 	SetWindowText(hWnd, header.str().c_str());
 }
 
-void SetCurrentImage0(HWND hWnd, int imageIndex) {
+static void SetCurrentImage0(HWND hWnd) {
 	image_shift.reset();
 
 	// Проверяем, есть ли уже закешированное декодированное изображение
@@ -477,8 +494,7 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 			// Декодируем из ZIP-архива
 			std::vector<uint8_t> imageData;
 			if (ZipArchiveManager::Instance().ExtractImage(files[current_image].wstring(), imageData)) {
-				decodedImagesCache[current_image] = ImageDecoderChain::Instance().DecodeFromMemory(
-					imageData.data(), imageData.size(), files[current_image].c_str());
+				decodedImagesCache[current_image] = ImageDecoderChain::Instance().DecodeFromMemory(imageData.data(), imageData.size(), files[current_image].c_str());
 			}
 		}
 		else {
@@ -510,7 +526,7 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 	}
 
 	scale = CalculateScale(hWnd, cachedImage->width, cachedImage->height);
-	UpdateWindowTitle(hWnd, *cachedImage, scale);
+	UpdateWindowTitle(hWnd);
 
 	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
@@ -522,14 +538,14 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 	}
 }
 
-void SetCurrentImage(HWND hWnd, int imageIndex) {
-	SetCurrentImage0(hWnd, imageIndex);
+static void SetCurrentImage(HWND hWnd) {
+	SetCurrentImage0(hWnd);
 
 	// Инвалидируем окно для перерисовки через Direct2D
 	InvalidateRect(hWnd, NULL, FALSE);
 }
 
-ComPtr<ID2D1Bitmap> CreateD2DBitmapFromDecoded(ID2D1RenderTarget* pRenderTarget, const DecodedImage& image) {
+static ComPtr<ID2D1Bitmap> CreateD2DBitmapFromDecoded(ID2D1RenderTarget* pRenderTarget, const DecodedImage& image) {
 	D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
 			image.hasAlpha ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE)
@@ -551,7 +567,7 @@ ComPtr<ID2D1Bitmap> CreateD2DBitmapFromDecoded(ID2D1RenderTarget* pRenderTarget,
 	return d2dBitmap;
 }
 
-void DrawImage(HWND hWnd) {
+static void DrawImage(HWND hWnd) {
 	auto drawStart = std::chrono::high_resolution_clock::now();
 
 	DecodedImage* cachedImage = decodedImagesCache[current_image].get();
@@ -621,7 +637,7 @@ void DrawImage(HWND hWnd) {
 	OutputDebugStringW(debugMsg.str().c_str());
 }
 
-void PreviousImage(HWND hWnd)
+static void PreviousImage(HWND hWnd)
 {
 	if (block_changing_of_current_image)
 		return;
@@ -633,10 +649,10 @@ void PreviousImage(HWND hWnd)
 
 	current_image--;
 
-	SetCurrentImage(hWnd, current_image);
+	SetCurrentImage(hWnd);
 }
 
-void NextImage(HWND hWnd)
+static void NextImage(HWND hWnd)
 {
 	if (block_changing_of_current_image)
 		return;
@@ -647,10 +663,10 @@ void NextImage(HWND hWnd)
 
 	current_image++;
 
-	SetCurrentImage(hWnd, current_image);
+	SetCurrentImage(hWnd);
 }
 
-std::vector<std::wstring> parse_command_line()
+static std::vector<std::wstring> parse_command_line(PWSTR pCmdLine)
 {
 	std::vector<std::wstring>	result;
 
@@ -658,7 +674,7 @@ std::vector<std::wstring> parse_command_line()
 	int nArgs;
 	int i;
 
-	szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+	szArglist = CommandLineToArgvW(pCmdLine, &nArgs);
 	if (NULL == szArglist)
 	{
 		return result;
@@ -673,7 +689,7 @@ std::vector<std::wstring> parse_command_line()
 	return result;
 }
 
-INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
 	if (OleInitialize(NULL) != S_OK)
 		return -1;
@@ -681,7 +697,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	HWND hWnd;
 	MSG msg;
 
-	auto parameters = parse_command_line();
+	auto parameters = parse_command_line(pCmdLine);
 
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -697,7 +713,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	BuildExtensionsList();
 
-	auto root = parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path();
+	auto root = parameters.size() == 1 ? std::filesystem::path(parameters[0]) : std::filesystem::current_path();
 	
 	// Проверяем, является ли путь ZIP-файлом
 	if (IsZipFile(root)) {
@@ -743,15 +759,15 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	// Создаём Direct2D Render Target для окна с аппаратным ускорением
 	RECT rc;
 	GetClientRect(hWnd, &rc);
-	D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+	auto size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
 
-	D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+	auto rtProps = D2D1::RenderTargetProperties(
 		D2D1_RENDER_TARGET_TYPE_HARDWARE,
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
 		96.0f, 96.0f
 	);
 
-	D2D1_HWND_RENDER_TARGET_PROPERTIES hwndRtProps = D2D1::HwndRenderTargetProperties(
+	auto hwndRtProps = D2D1::HwndRenderTargetProperties(
 		hWnd,
 		size,
 		D2D1_PRESENT_OPTIONS_IMMEDIATELY
@@ -774,7 +790,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 
 	ShowWindow(hWnd, SW_MAXIMIZE);
 
-	SetCurrentImage0(hWnd, 0);
+	SetCurrentImage0(hWnd);
 
 	UpdateWindow(hWnd);
 
@@ -803,4 +819,4 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	OleUninitialize();
 
 	return (int)msg.wParam;
-}  // WinMain
+}  // wWinMain
