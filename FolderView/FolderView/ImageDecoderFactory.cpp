@@ -26,8 +26,7 @@ std::unique_ptr<DecodedImage> ImageDecoderChain::Decode(const wchar_t* path) {
             auto decoded = decoder->Decode(path);
             if (decoded && decoded->IsValid()) {
                 wchar_t msg[512];
-                swprintf_s(msg, L"[ImageDecoder] Decoded with %s: %s\n", 
-                    decoder->Name(), path);
+                swprintf_s(msg, L"[ImageDecoder] Decoded with %s: %s\n", decoder->Name(), path);
                 OutputDebugStringW(msg);
                 return decoded;
             }
@@ -45,8 +44,7 @@ std::unique_ptr<DecodedImage> ImageDecoderChain::DecodeFromMemory(const uint8_t*
             auto decoded = decoder->DecodeFromMemory(data, size, hint);
             if (decoded && decoded->IsValid()) {
                 wchar_t msg[512];
-                swprintf_s(msg, L"[ImageDecoder] Decoded from memory with %s: %s\n", 
-                    decoder->Name(), hint);
+                swprintf_s(msg, L"[ImageDecoder] Decoded from memory with %s: %s\n", decoder->Name(), hint);
                 OutputDebugStringW(msg);
                 return decoded;
             }
@@ -73,8 +71,7 @@ void ImageDecoderChain::Initialize() {
     }
     
     wchar_t msg[256];
-    swprintf_s(msg, L"[ImageDecoder] Initialized with %zu decoders\n", 
-        chain.decoders_.size());
+    swprintf_s(msg, L"[ImageDecoder] Initialized with %zu decoders\n", chain.decoders_.size());
     OutputDebugStringW(msg);
 }
 
