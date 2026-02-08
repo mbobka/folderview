@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 
+  Настройки для дополнительных декодеров изображений.
+  Раскомментируйте нужные секции после установки соответствующих библиотек.
+  
+  Для nvJPEG установите CUDA Toolkit:
+    https://developer.nvidia.com/cuda-toolkit
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  
+  <!-- ============================================== -->
+  <!-- NVIDIA nvJPEG (GPU-ускоренный декодер)         -->
+  <!-- Требует: CUDA Toolkit                           -->
+  <!-- ============================================== -->
+  
+  <PropertyGroup>
+    <CudaRoot Condition="'$(CUDA_PATH)' != ''">$(CUDA_PATH)</CudaRoot>
+    <HasCuda Condition="Exists('$(CudaRoot)')">true</HasCuda>
+  </PropertyGroup>
+  
+  <ItemDefinitionGroup Condition="'$(HasCuda)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>HAS_NVJPEG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(CudaRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(CudaRoot)\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>nvjpeg.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  
+</Project>

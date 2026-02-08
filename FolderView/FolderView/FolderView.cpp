@@ -1,19 +1,26 @@
-﻿// for IDE sake
+// for IDE sake
 #include "targetver.h"
 #include "Resource.h"
 
 // Windows Header Files
-#define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <objidl.h>
-#include <gdiplus.h>
 #include <shlobj.h>
 #include <atlbase.h>
 #include <VersionHelpers.h>
-using namespace Gdiplus;
-#pragma comment (lib,"Gdiplus.lib")
+
+// Direct2D
+#include <d2d1.h>
+#include <d2d1_1.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "windowscodecs.lib")
+
+using Microsoft::WRL::ComPtr;
 #undef min
 #undef max
 
@@ -22,31 +29,32 @@ using namespace Gdiplus;
 #include <filesystem>
 #include <string>
 #include <sstream>
-#include <thread>
-#include <atomic>
+#include <iomanip>
+#include <chrono>
 
 #include "AlmostEquals.h"
+#include "ImageDecoder.h"
 
 void BuildExtensionsList();
 void BuildFilesList(std::filesystem::path const& file_or_folder);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
-void DrawImage(HWND hWnd, Bitmap& image, Graphics* php = nullptr);
+void DrawImage(HWND hWnd);
 void SetCurrentImage(HWND hWnd, int imageIndex);
-float CalculateScale(HWND hWnd, Bitmap& image);
+float CalculateScale(HWND hWnd, int width, int height);
+
+// Direct2D globals
+ComPtr<ID2D1Factory> g_pD2DFactory;
+ComPtr<ID2D1HwndRenderTarget> g_pRenderTarget;
+
+// Кэш декодированных изображений
+std::vector<std::unique_ptr<DecodedImage>> decodedImagesCache;
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
 
-std::vector<std::tuple<std::unique_ptr<CachedBitmap>, int, int>> bitmaps;
-
-std::atomic<bool>				abort_draw_image(false);
-std::unique_ptr<std::thread>	current_drawing_thread;
-
 size_t current_image = 0;
 bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
-
-std::unique_ptr<Bitmap> image;
 std::unique_ptr<POINT> image_shift; // насколько изображение сдвинуто
 
 float scale = 1.0f;
@@ -113,94 +121,23 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 		files.push_back(entryx.path());
 	}
 
-	bitmaps.resize(files.size());
+	decodedImagesCache.resize(files.size());
 }
 
 void BuildExtensionsList()
 {
-	UINT decoders_count, decoders_size;
-	Gdiplus::GetImageDecodersSize(&decoders_count, &decoders_size);
-
-	auto decoders = reinterpret_cast<ImageCodecInfo*>(malloc(decoders_size));
-	if (decoders == nullptr)
-		throw std::bad_alloc();
-
-	Gdiplus::GetImageDecoders(decoders_count, decoders_size, decoders);
-
-	for (size_t i = 0; i < decoders_count; i++) {
-		if((i + 1) * sizeof(decoders[0]) >= decoders_size) {
-			free(decoders);
-			throw std::exception();
-		}
-
-		std::wistringstream f(std::wstring(decoders[i].FilenameExtension));
-		std::wstring s;
-		while (std::getline(f, s, L';')) {
-			extensions.push_back(s.c_str() + 1);
-		}
-	}
-
-	free(decoders);
-}
-
-Rect CalculateImageRect(HWND hwnd, Bitmap& image, float scale) {
-	RectF	imageBounds;
-	Unit	imageUnits;
-	image.GetBounds(&imageBounds, &imageUnits);
-
-	RECT	clientRect;
-	GetClientRect(hwnd, &clientRect);
-
-	auto cw = clientRect.right - clientRect.left;
-	auto ch = clientRect.bottom - clientRect.top;
-
-	auto dw = (cw - imageBounds.Width * scale) / 2.0f;
-	auto dh = (ch - imageBounds.Height * scale) / 2.0f;
-
-	auto x = std::max(0.0f, dw);
-	auto y = std::max(0.0f, dh);
-
-	int iw = std::round(std::min<float>(cw, imageBounds.Width * scale));
-	int ih = std::round(std::min<float>(ch, imageBounds.Height * scale));
-
-	return Rect(Point(x, y), Size(iw, ih));
-}
-
-LPCTSTR pixelFormat(PixelFormat pf) {
-	switch (pf) {
-	case PixelFormat1bppIndexed:   return TEXT("1bpp Indexed");
-	case PixelFormat4bppIndexed:   return TEXT("4bpp Indexed");
-	case PixelFormat8bppIndexed:   return TEXT("8bpp Indexed");
-	case PixelFormat16bppGrayScale:return TEXT("16bpp GrayScale");
-	case PixelFormat16bppRGB555:   return TEXT("16bpp RGB555");
-	case PixelFormat16bppRGB565:   return TEXT("16bpp RGB565");
-	case PixelFormat16bppARGB1555: return TEXT("16bpp ARGB1555");
-	case PixelFormat24bppRGB:	   return TEXT("24bpp RGB");
-	case PixelFormat32bppRGB:	   return TEXT("32bpp RGB");
-	case PixelFormat32bppARGB:	   return TEXT("32bpp ARGB");
-	case PixelFormat32bppPARGB:	   return TEXT("32bpp PARGB");
-	case PixelFormat48bppRGB:	   return TEXT("48bpp RGB");
-	case PixelFormat64bppARGB:	   return TEXT("64bpp ARGB");
-	case PixelFormat64bppPARGB:	   return TEXT("64bpp PARGB");
-	case PixelFormat32bppCMYK:	   return TEXT("32bpp CMYK");
-	}
-	return nullptr;
-}
-
-LPCTSTR getFormat(GUID& formatGuid) {
-	if (IsEqualGUID(formatGuid, ImageFormatBMP)) return TEXT("BMP");
-	if (IsEqualGUID(formatGuid, ImageFormatEMF)) return TEXT("EMF");
-	if (IsEqualGUID(formatGuid, ImageFormatWMF)) return TEXT("WMF");
-	if (IsEqualGUID(formatGuid, ImageFormatJPEG)) return TEXT("JPEG");
-	if (IsEqualGUID(formatGuid, ImageFormatPNG)) return TEXT("PNG");
-	if (IsEqualGUID(formatGuid, ImageFormatGIF)) return TEXT("GIF");
-	if (IsEqualGUID(formatGuid, ImageFormatTIFF)) return TEXT("TIFF");
-	if (IsEqualGUID(formatGuid, ImageFormatEXIF)) return TEXT("EXIF");
-	if (IsEqualGUID(formatGuid, ImageFormatIcon)) return TEXT("Icon");
-	if (IsEqualGUID(formatGuid, ImageFormatHEIF)) return TEXT("HEIF");
-	if (IsEqualGUID(formatGuid, ImageFormatWEBP)) return TEXT("WEBP");
-
-	return nullptr;
+	// Список поддерживаемых расширений (WIC поддерживает их все)
+	extensions.push_back(L".jpg");
+	extensions.push_back(L".jpeg");
+	extensions.push_back(L".png");
+	extensions.push_back(L".bmp");
+	extensions.push_back(L".gif");
+	extensions.push_back(L".tiff");
+	extensions.push_back(L".tif");
+	extensions.push_back(L".ico");
+	extensions.push_back(L".webp");
+	extensions.push_back(L".heif");
+	extensions.push_back(L".heic");
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -292,7 +229,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case '0':
 		case VK_MULTIPLY:
 			if (AlmostEquals(scale, 1.0f)) {
-				scale = CalculateScale(hWnd, *image);
+				scale = CalculateScale(hWnd, decodedImagesCache[current_image]->width, decodedImagesCache[current_image]->height);
 				if (AlmostEquals(scale, 1.0f))
 					return 0;
 			}
@@ -344,26 +281,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// When moving the mouse, the user must hold down 
 		// the left mouse button to drag the image. 
 
-		if (wParam & MK_LBUTTON)
+		if ((wParam & MK_LBUTTON) && decodedImagesCache[current_image])
 		{
 			// Установить новые координаты сдвига, ограничивая их изменения
 			if (!image_shift) {
 				image_shift.reset(new POINT{ 0,0 });
 			}
 
-			RectF	imageBounds;
-			Unit	imageUnits;
-			image->GetBounds(&imageBounds, &imageUnits);
+			int imgWidth = decodedImagesCache[current_image]->width;
+			int imgHeight = decodedImagesCache[current_image]->height;
 
-			RECT	clientRect;
+			RECT clientRect;
 			GetClientRect(hWnd, &clientRect);
 
 			auto cw = clientRect.right - clientRect.left;
 			auto ch = clientRect.bottom - clientRect.top;
 
 			// следующим дапазоном: 
-			auto limit_x = std::max<LONG>(0, -cw + imageBounds.Width * scale);
-			auto limit_y = std::max<LONG>(0, -ch + imageBounds.Height * scale);
+			auto limit_x = std::max<LONG>(0, -cw + (LONG)(imgWidth * scale));
+			auto limit_y = std::max<LONG>(0, -ch + (LONG)(imgHeight * scale));
 
 			POINT old_position = *image_shift;
 
@@ -398,13 +334,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		ReleaseCapture();
 		return 0;
 
+	case WM_SIZE:
+		if (g_pRenderTarget) {
+			RECT rc;
+			GetClientRect(hWnd, &rc);
+			D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+			g_pRenderTarget->Resize(size);
+		}
+		break;
+
 	case WM_PAINT:
 	{
-		PAINTSTRUCT  ps;
-		HDC          hdc = BeginPaint(hWnd, &ps);
-		Graphics hp(hdc);
+		PAINTSTRUCT ps;
+		BeginPaint(hWnd, &ps);
 
-		DrawImage(hWnd, *image, &hp);
+		DrawImage(hWnd);
 
 		EndPaint(hWnd, &ps);
 
@@ -419,7 +363,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return DefWindowProc(hWnd, message, wParam, lParam);
 } // WndProc
 
-float CalculateScale(HWND hWnd, Bitmap& image) {
+float CalculateScale(HWND hWnd, int imgWidth, int imgHeight) {
 	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
 
@@ -428,103 +372,37 @@ float CalculateScale(HWND hWnd, Bitmap& image) {
 	if (wpl.showCmd != SW_MAXIMIZE)
 		return 1.0f;
 
-	RectF	imageBounds;
-	Unit	imageUnits;
-	image.GetBounds(&imageBounds, &imageUnits);
-
-	RECT	clientRect;
+	RECT clientRect;
 	GetClientRect(hWnd, &clientRect);
 
 	auto cw = clientRect.right - clientRect.left;
 	auto ch = clientRect.bottom - clientRect.top;
 
-	if (imageBounds.Width > cw) {
-		scale /= imageBounds.Width / (float)cw;
+	if (imgWidth > cw) {
+		scale /= imgWidth / (float)cw;
 	}
 
-	if (imageBounds.Height * scale > ch) {
-		scale /= imageBounds.Height * scale / (float)ch;
-		imageBounds.Height = ch;
+	if (imgHeight * scale > ch) {
+		scale /= imgHeight * scale / (float)ch;
 	}
 
 	return scale;
 }
 
-void EraseOldImageBackground(HWND hWnd, Rect const& old_image_rect, Rect const& new_image_rect)
+void UpdateWindowTitle(HWND hWnd, const DecodedImage& image, float scale)
 {
-	Graphics	hp(hWnd);
+	std::wstringstream header;
 
-	RECT	clientRect;
-	GetClientRect(hWnd, &clientRect);
+	header << files[current_image].c_str();
 
-	Rect overlap;
+	header << L" [" << image.width << "x" << image.height;
 
-	if (!image) {
-		Rect r0(clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
+	if (image.hasAlpha)
+		header << L" RGBA";
+	else
+		header << L" RGB";
 
-		SolidBrush f0(Color::DarkGray);
-
-		hp.FillRectangle(&f0, r0);
-		hp.Flush();
-
-		return;
-	}
-
-	if (Rect::Intersect(overlap, new_image_rect, old_image_rect)) {
-		int oix = clientRect.left;
-		int oiy = clientRect.top;
-		int oixw = clientRect.right;
-		int oiyh = clientRect.bottom;
-
-		int ovx = overlap.X;
-		int ovy = overlap.Y;
-		int ovxw = overlap.X + overlap.Width;
-		int ovyh = overlap.Y + overlap.Height;
-
-		Rect r0(oix, oiy, oixw - oix, ovy - oiy);
-		Rect r1(oix, ovy, ovx - oix, ovyh - ovy);
-		Rect r2(ovxw, ovy, oixw - ovxw, ovyh - ovy);
-		Rect r3(oix, ovyh, oixw - oix, oiyh - ovyh);
-
-		SolidBrush f0(Color::DarkGray);
-		SolidBrush f1(Color::DarkGray);
-		SolidBrush f2(Color::DarkGray);
-		SolidBrush f3(Color::DarkGray);
-
-		hp.FillRectangle(&f0, r0);
-		hp.FillRectangle(&f1, r1);
-		hp.FillRectangle(&f2, r2);
-		hp.FillRectangle(&f3, r3);
-	}
-
-	hp.Flush();
-}
-
-void UpdateWindowTitle(HWND hWnd, Bitmap& image, float scale)
-{
-	std::wstringstream	header;
-
-	auto pixel_format = image.GetPixelFormat();
-	SizeF bounds;
-	image.GetPhysicalDimension(&bounds);
-
-	header
-		<< files[current_image].c_str();
-
-	GUID	raw_format;
-	image.GetRawFormat(&raw_format);
-
-	if (getFormat(raw_format))
-		header << L" " << getFormat(raw_format);
-
-	header
-		<< L" [" << (int)bounds.Width << "x" << (int)bounds.Height;
-
-	if (pixelFormat(pixel_format))
-		header << L" " << pixelFormat(pixel_format);
-
-	header
-		<< L"] "
+	header << L"] "
 		<< std::fixed << std::setprecision(0) << scale * 100.0f << L"%";
 
 	SetWindowText(hWnd, header.str().c_str());
@@ -533,107 +411,152 @@ void UpdateWindowTitle(HWND hWnd, Bitmap& image, float scale)
 void SetCurrentImage0(HWND hWnd, int imageIndex) {
 	image_shift.reset();
 
-	image.reset(Bitmap::FromFile(files[current_image].c_str()));
+	// Проверяем, есть ли уже закешированное декодированное изображение
+	DecodedImage* cachedImage = decodedImagesCache[current_image].get();
 
-	scale = CalculateScale(hWnd, *image);
-	UpdateWindowTitle(hWnd, *image, scale);
+	if (cachedImage && cachedImage->IsValid()) {
+		// Используем кеш, декодирование не нужно
+		std::wstringstream debugMsg;
+		debugMsg << L"[DECODE] " << files[current_image].filename().c_str() << L": CACHED (skipped)\n";
+		OutputDebugStringW(debugMsg.str().c_str());
+	}
+	else {
+		// Декодируем и сохраняем в кеш
+		auto decodeStart = std::chrono::high_resolution_clock::now();
+		decodedImagesCache[current_image] = ImageDecoderChain::Instance().Decode(files[current_image].c_str());
+		auto decodeEnd = std::chrono::high_resolution_clock::now();
+
+		cachedImage = decodedImagesCache[current_image].get();
+		if (!cachedImage || !cachedImage->IsValid()) {
+			MessageBox(hWnd, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		auto decodeUs = std::chrono::duration_cast<std::chrono::microseconds>(decodeEnd - decodeStart).count();
+		std::wstringstream debugMsg;
+		debugMsg << L"[DECODE] " << files[current_image].filename().c_str() << L": " << decodeUs << L" us\n";
+		OutputDebugStringW(debugMsg.str().c_str());
+
+		// Очищаем дальний кеш для экономии памяти
+		const size_t cache_epsilon = 20;
+		for (size_t i = 0; i + cache_epsilon < current_image; i++) {
+			decodedImagesCache[i].reset();
+		}
+		for (size_t i = current_image + cache_epsilon; i < decodedImagesCache.size(); i++) {
+			decodedImagesCache[i].reset();
+		}
+	}
+
+	scale = CalculateScale(hWnd, cachedImage->width, cachedImage->height);
+	UpdateWindowTitle(hWnd, *cachedImage, scale);
 
 	WINDOWPLACEMENT wpl = { 0 };
 	GetWindowPlacement(hWnd, &wpl);
 
 	if (wpl.showCmd != SW_MAXIMIZE) {
-		SizeF bounds;
-		image->GetPhysicalDimension(&bounds);
-
-		RECT rect{ 0, 0, bounds.Width, bounds.Height };
+		RECT rect{ 0, 0, (LONG)cachedImage->width, (LONG)cachedImage->height };
 		AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 		SetWindowPos(hWnd, nullptr, 0, 0, -rect.left + rect.right, -rect.top + rect.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREDRAW);
 	}
 }
 
 void SetCurrentImage(HWND hWnd, int imageIndex) {
-	std::unique_ptr<Bitmap> old_image;
-
-	old_image.swap(image);
-	auto old_scale = scale;
-
 	SetCurrentImage0(hWnd, imageIndex);
 
-	if (old_image)
-		EraseOldImageBackground(hWnd, CalculateImageRect(hWnd, *old_image, old_scale), CalculateImageRect(hWnd, *image, scale));
-
-	DrawImage(hWnd, *image);
+	// Инвалидируем окно для перерисовки через Direct2D
+	InvalidateRect(hWnd, NULL, FALSE);
 }
 
-void DrawImage(HWND hWnd, Bitmap& image, Graphics* php) {
-	CachedBitmap* cached_bitmap = std::get<0>(bitmaps[current_image]).get();
+ComPtr<ID2D1Bitmap> CreateD2DBitmapFromDecoded(ID2D1RenderTarget* pRenderTarget, const DecodedImage& image) {
+	D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(
+		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+			image.hasAlpha ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE)
+	);
 
-	int cached_w = std::get<1>(bitmaps[current_image]);
-	int cached_h = std::get<2>(bitmaps[current_image]);
+	ComPtr<ID2D1Bitmap> d2dBitmap;
+	HRESULT hr = pRenderTarget->CreateBitmap(
+		D2D1::SizeU(image.width, image.height),
+		image.pixels.data(),
+		image.stride,
+		bitmapProps,
+		&d2dBitmap
+	);
 
-	auto image_rect = CalculateImageRect(hWnd, image, scale);
-	if (php == nullptr) {
-		if (current_drawing_thread) {
-			abort_draw_image = true;
-			current_drawing_thread->join();
-		}
-		abort_draw_image = false;
+	if (FAILED(hr)) {
+		return nullptr;
+	}
 
-		current_drawing_thread.reset(
-			new std::thread([image_rect, hWnd, &image]() {
-				SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+	return d2dBitmap;
+}
 
-				Graphics hp(hWnd);
+void DrawImage(HWND hWnd) {
+	auto drawStart = std::chrono::high_resolution_clock::now();
 
-				if (abort_draw_image)
-					return;
+	DecodedImage* cachedImage = decodedImagesCache[current_image].get();
+	if (!g_pRenderTarget || !cachedImage || !cachedImage->IsValid())
+		return;
 
-				hp.DrawImage(&image, image_rect);
-				hp.Flush();
-
-				}));
-
-		current_drawing_thread->join();
-		current_drawing_thread.reset();
-
+	// Проверяем состояние render target
+	D2D1_WINDOW_STATE windowState = g_pRenderTarget->CheckWindowState();
+	if (windowState & D2D1_WINDOW_STATE_OCCLUDED) {
 		return;
 	}
 
-	if (image_shift || !cached_bitmap || cached_w != image_rect.Width || cached_h != image_rect.Height)
-	{
-		Bitmap  b(image_rect.Width, image_rect.Height);
-		std::unique_ptr<Graphics> g(Graphics::FromImage(&b));
+	int imgWidth = cachedImage->width;
+	int imgHeight = cachedImage->height;
 
-		if (image_shift)
-			g->TranslateTransform(image_shift->x, image_shift->y);
+	// Создаём D2D bitmap из DecodedImage
+	ComPtr<ID2D1Bitmap> d2dBitmap = CreateD2DBitmapFromDecoded(g_pRenderTarget.Get(), *cachedImage);
 
-		g->ScaleTransform(scale, scale);
+	if (!d2dBitmap)
+		return;
 
-		RectF	imageBounds;
-		Unit	imageUnits;
-		image.GetBounds(&imageBounds, &imageUnits);
+	// Получаем размеры клиентской области
+	RECT clientRect;
+	GetClientRect(hWnd, &clientRect);
+	float cw = static_cast<float>(clientRect.right - clientRect.left);
+	float ch = static_cast<float>(clientRect.bottom - clientRect.top);
 
-		g->DrawImage(&image, 0.0f, 0.0f, imageBounds.Width, imageBounds.Height);
+	// Вычисляем позицию изображения (центрирование)
+	float scaledWidth = imgWidth * scale;
+	float scaledHeight = imgHeight * scale;
 
-		g.reset();
+	float destX = std::max(0.0f, (cw - scaledWidth) / 2.0f);
+	float destY = std::max(0.0f, (ch - scaledHeight) / 2.0f);
 
-		cached_bitmap = new CachedBitmap(&b, php);
-
-		cached_h = image_rect.Height;
-		cached_w = image_rect.Width;
-
-		bitmaps[current_image] = std::make_tuple(std::unique_ptr<CachedBitmap>(cached_bitmap), cached_w, cached_h);
-
-		const int cache_epsilon = 20; // сколько в окресности держать кешированных изображений
-		for (int i = 0; i < (int)current_image - cache_epsilon; i++) {
-			bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
-		}
-		for (int i = current_image + cache_epsilon; i < bitmaps.size(); i++) {
-			bitmaps[i] = std::make_tuple(std::unique_ptr<CachedBitmap>(), 0, 0);
-		}
+	// Применяем сдвиг если есть
+	if (image_shift) {
+		destX += image_shift->x;
+		destY += image_shift->y;
 	}
 
-	php->DrawCachedBitmap(cached_bitmap, image_rect.X, image_rect.Y);
+	D2D1_RECT_F destRect = D2D1::RectF(destX, destY, destX + scaledWidth, destY + scaledHeight);
+
+	g_pRenderTarget->BeginDraw();
+
+	// Заливаем фон
+	g_pRenderTarget->Clear(D2D1::ColorF(0.66f, 0.66f, 0.66f)); // DarkGray
+
+	// Рисуем изображение с интерполяцией
+	g_pRenderTarget->DrawBitmap(
+		d2dBitmap.Get(),
+		destRect,
+		1.0f,
+		D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+	);
+
+	HRESULT hr = g_pRenderTarget->EndDraw();
+
+	if (hr == D2DERR_RECREATE_TARGET) {
+		// Render target потерян, нужно пересоздать
+		g_pRenderTarget.Reset();
+	}
+
+	auto drawEnd = std::chrono::high_resolution_clock::now();
+	auto drawUs = std::chrono::duration_cast<std::chrono::microseconds>(drawEnd - drawStart).count();
+	std::wstringstream debugMsg;
+	debugMsg << L"[DRAW] " << drawUs << L" us\n";
+	OutputDebugStringW(debugMsg.str().c_str());
 }
 
 void PreviousImage(HWND hWnd)
@@ -693,25 +616,31 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	if (OleInitialize(NULL) != S_OK)
 		return -1;
 
-	HWND                hWnd;
-	MSG                 msg;
-	GdiplusStartupInput gdiplusStartupInput;
-	ULONG_PTR           gdiplusToken;
+	HWND hWnd;
+	MSG msg;
 
 	auto parameters = parse_command_line();
 
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+	// Инициализируем Direct2D Factory
+	HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_pD2DFactory.GetAddressOf());
+	if (FAILED(hr)) {
+		MessageBox(NULL, L"Failed to create Direct2D factory", L"Error", MB_OK | MB_ICONERROR);
+		return -1;
+	}
+
+	// Инициализируем цепочку декодеров
+	ImageDecoderChain::Initialize();
 
 	BuildExtensionsList();
 
 	auto root = parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path();
 	BuildFilesList(root);
 
-	HBRUSH background = CreateSolidBrush(Gdiplus::Color(Gdiplus::Color::DarkGray).ToCOLORREF());
+	HBRUSH background = CreateSolidBrush(RGB(169, 169, 169)); // DarkGray
 
-	WNDCLASSEXW wndClass {};
+	WNDCLASSEXW wndClass{};
 
 	wndClass.cbSize = sizeof(wndClass);
 	wndClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -741,11 +670,44 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		hInstance,                // program instance handle
 		NULL);                    // creation parameters
 
+	// Создаём Direct2D Render Target для окна с аппаратным ускорением
+	RECT rc;
+	GetClientRect(hWnd, &rc);
+	D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+
+	D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+		D2D1_RENDER_TARGET_TYPE_HARDWARE,  // Принудительно GPU
+		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+		96.0f, 96.0f
+	);
+
+	D2D1_HWND_RENDER_TARGET_PROPERTIES hwndRtProps = D2D1::HwndRenderTargetProperties(
+		hWnd,
+		size,
+		D2D1_PRESENT_OPTIONS_IMMEDIATELY  // Без VSync для максимальной скорости
+	);
+
+	hr = g_pD2DFactory->CreateHwndRenderTarget(rtProps, hwndRtProps, &g_pRenderTarget);
+
+	// Если GPU недоступен, fallback на software
+	if (FAILED(hr)) {
+		rtProps.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+		hr = g_pD2DFactory->CreateHwndRenderTarget(rtProps, hwndRtProps, &g_pRenderTarget);
+
+		OutputDebugStringW(L"GPU render target creation failed, falling back to software rendering.\n");
+	}
+
+	if (FAILED(hr)) {
+		MessageBox(NULL, L"Failed to create Direct2D render target", L"Error", MB_OK | MB_ICONERROR);
+		return -1;
+	}
+
 	ShowWindow(hWnd, SW_MAXIMIZE);
 
 	SetCurrentImage0(hWnd, 0);
 
 	UpdateWindow(hWnd);
+
 
 	while (GetMessage(&msg, NULL, 0, 0))
 	{
@@ -753,21 +715,17 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 		DispatchMessage(&msg);
 	}
 
-	if (current_drawing_thread)
-	{
-		abort_draw_image = true;
-		current_drawing_thread->join();
-	}
-
-	image.reset();
-
-	bitmaps.clear();
+	// Освобождаем кеш
+	decodedImagesCache.clear();
+	g_pRenderTarget.Reset();
+	g_pD2DFactory.Reset();
 
 	DeleteObject(background);
 
-	GdiplusShutdown(gdiplusToken);
+	// Освобождаем ресурсы декодеров
+	ImageDecoderChain::Shutdown();
 
 	OleUninitialize();
 
-	return msg.wParam;
+	return (int)msg.wParam;
 }  // WinMain
