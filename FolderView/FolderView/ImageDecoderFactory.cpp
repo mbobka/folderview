@@ -38,6 +38,25 @@ std::unique_ptr<DecodedImage> ImageDecoderChain::Decode(const wchar_t* path) {
     return nullptr;
 }
 
+std::unique_ptr<DecodedImage> ImageDecoderChain::DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) {
+    // Пробуем каждый декодер по порядку приоритета
+    for (auto& decoder : decoders_) {
+        if (decoder->CanDecode(hint)) {
+            auto decoded = decoder->DecodeFromMemory(data, size, hint);
+            if (decoded && decoded->IsValid()) {
+                wchar_t msg[512];
+                swprintf_s(msg, L"[ImageDecoder] Decoded from memory with %s: %s\n", 
+                    decoder->Name(), hint);
+                OutputDebugStringW(msg);
+                return decoded;
+            }
+        }
+    }
+    
+    OutputDebugStringW(L"[ImageDecoder] All decoders failed for memory decode!\n");
+    return nullptr;
+}
+
 void ImageDecoderChain::Initialize() {
     auto& chain = Instance();
     

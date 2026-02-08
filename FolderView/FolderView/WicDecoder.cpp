@@ -3,6 +3,8 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cctype>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -59,8 +61,35 @@ public:
         
         if (FAILED(hr)) return nullptr;
 
+        return DecodeFromWicDecoder(decoder.Get());
+    }
+
+    std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) override {
+        if (!factory_ || !data || size == 0) return nullptr;
+
+        // Создаём IStream из данных в памяти
+        ComPtr<IStream> stream;
+        stream.Attach(SHCreateMemStream(data, static_cast<UINT>(size)));
+        if (!stream) return nullptr;
+
+        ComPtr<IWICBitmapDecoder> decoder;
+        HRESULT hr = factory_->CreateDecoderFromStream(
+            stream.Get(),
+            nullptr,
+            WICDecodeMetadataCacheOnDemand,
+            &decoder);
+        
+        if (FAILED(hr)) return nullptr;
+
+        return DecodeFromWicDecoder(decoder.Get());
+    }
+
+private:
+    std::unique_ptr<DecodedImage> DecodeFromWicDecoder(IWICBitmapDecoder* decoder) {
+        if (!decoder) return nullptr;
+
         ComPtr<IWICBitmapFrameDecode> frame;
-        hr = decoder->GetFrame(0, &frame);
+        HRESULT hr = decoder->GetFrame(0, &frame);
         if (FAILED(hr)) return nullptr;
 
         UINT width, height;

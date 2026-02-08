@@ -34,9 +34,12 @@ using Microsoft::WRL::ComPtr;
 
 #include "AlmostEquals.h"
 #include "ImageDecoder.h"
+#include "ZipArchive.h"
 
 void BuildExtensionsList();
 void BuildFilesList(std::filesystem::path const& file_or_folder);
+void BuildFilesListFromZip(const std::wstring& zipPath);
+bool IsZipFile(const std::filesystem::path& path);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
 void DrawImage(HWND hWnd);
@@ -52,6 +55,7 @@ std::vector<std::unique_ptr<DecodedImage>> decodedImagesCache;
 
 std::vector<std::wstring> extensions;
 std::vector<std::filesystem::path> files;
+bool g_isZipMode = false; // Режим работы с ZIP-архивом
 
 size_t current_image = 0;
 bool block_changing_of_current_image = false; // запрещает изменять текущее изображение, например, при перетаскивании мышкой
@@ -122,6 +126,39 @@ void BuildFilesList(std::filesystem::path const& file_or_folder)
 	}
 
 	decodedImagesCache.resize(files.size());
+}
+
+bool IsZipFile(const std::filesystem::path& path)
+{
+	std::wstring ext = path.extension().wstring();
+	std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+	return ext == L".zip";
+}
+
+void BuildFilesListFromZip(const std::wstring& zipPath)
+{
+	auto& zipManager = ZipArchiveManager::Instance();
+	
+	if (!zipManager.OpenAsVirtualFolder(zipPath)) {
+		MessageBox(NULL, L"Не удалось открыть ZIP-архив", L"Folder view", MB_OK | MB_ICONERROR);
+		return;
+	}
+
+	g_isZipMode = true;
+
+	// Получаем список изображений из архива
+	auto imageFiles = zipManager.GetImageFiles(extensions);
+	
+	for (const auto& imageName : imageFiles) {
+		// Сохраняем имя файла в архиве как путь
+		files.push_back(std::filesystem::path(imageName));
+	}
+
+	decodedImagesCache.resize(files.size());
+
+	wchar_t msg[256];
+	swprintf_s(msg, L"[ZIP] Found %zu images in archive\n", files.size());
+	OutputDebugStringW(msg);
 }
 
 void BuildExtensionsList()
@@ -243,6 +280,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case 'C':
 		{
 			if (GetKeyState(VK_CONTROL) & 0x8000) {
+				// Копирование в буфер не поддерживается для ZIP
+				if (g_isZipMode) {
+					MessageBeep(MB_ICONWARNING);
+					return 0;
+				}
+				
 				CComPtr<IDataObject> spdto;
 
 				if (FAILED(GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto))) ||
@@ -393,7 +436,13 @@ void UpdateWindowTitle(HWND hWnd, const DecodedImage& image, float scale)
 {
 	std::wstringstream header;
 
-	header << files[current_image].c_str();
+	if (g_isZipMode) {
+		// Показываем путь к архиву и имя файла внутри
+		header << ZipArchiveManager::Instance().GetArchivePath() << L" -> " << files[current_image].c_str();
+	}
+	else {
+		header << files[current_image].c_str();
+	}
 
 	header << L" [" << image.width << "x" << image.height;
 
@@ -423,7 +472,20 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 	else {
 		// Декодируем и сохраняем в кеш
 		auto decodeStart = std::chrono::high_resolution_clock::now();
-		decodedImagesCache[current_image] = ImageDecoderChain::Instance().Decode(files[current_image].c_str());
+		
+		if (g_isZipMode) {
+			// Декодируем из ZIP-архива
+			std::vector<uint8_t> imageData;
+			if (ZipArchiveManager::Instance().ExtractImage(files[current_image].wstring(), imageData)) {
+				decodedImagesCache[current_image] = ImageDecoderChain::Instance().DecodeFromMemory(
+					imageData.data(), imageData.size(), files[current_image].c_str());
+			}
+		}
+		else {
+			// Декодируем из файла
+			decodedImagesCache[current_image] = ImageDecoderChain::Instance().Decode(files[current_image].c_str());
+		}
+		
 		auto decodeEnd = std::chrono::high_resolution_clock::now();
 
 		cachedImage = decodedImagesCache[current_image].get();
@@ -636,7 +698,15 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	BuildExtensionsList();
 
 	auto root = parameters.size() == 2 ? std::filesystem::path(parameters[1]) : std::filesystem::current_path();
-	BuildFilesList(root);
+	
+	// Проверяем, является ли путь ZIP-файлом
+	if (IsZipFile(root)) {
+		BuildFilesListFromZip(root.wstring());
+	}
+	else {
+		BuildFilesList(root);
+	}
+
 
 	HBRUSH background = CreateSolidBrush(RGB(169, 169, 169)); // DarkGray
 
@@ -721,6 +791,11 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	g_pD2DFactory.Reset();
 
 	DeleteObject(background);
+
+	// Закрываем ZIP-архив если был открыт
+	if (g_isZipMode) {
+		ZipArchiveManager::Instance().Close();
+	}
 
 	// Освобождаем ресурсы декодеров
 	ImageDecoderChain::Shutdown();

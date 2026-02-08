@@ -26,8 +26,11 @@ public:
     // Проверяет, может ли декодер обработать файл по расширению
     virtual bool CanDecode(const wchar_t* path) const = 0;
     
-    // Декодирует изображение
+    // Декодирует изображение из файла
     virtual std::unique_ptr<DecodedImage> Decode(const wchar_t* path) = 0;
+    
+    // Декодирует изображение из памяти (для ZIP)
+    virtual std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) = 0;
     
     // Проверяет доступность декодера (библиотека загружена, GPU есть и т.д.)
     virtual bool IsAvailable() const = 0;
@@ -48,6 +51,9 @@ public:
     
     // Декодирует файл, пробуя декодеры по приоритету
     std::unique_ptr<DecodedImage> Decode(const wchar_t* path);
+    
+    // Декодирует из памяти (для ZIP)
+    std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint);
     
     // Инициализирует цепочку декодеров
     static void Initialize();

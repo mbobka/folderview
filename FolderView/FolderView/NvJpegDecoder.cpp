@@ -70,12 +70,18 @@ public:
         file.read(reinterpret_cast<char*>(jpegData.data()), fileSize);
         file.close();
 
+        return DecodeFromMemory(jpegData.data(), jpegData.size(), path);
+    }
+
+    std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) override {
+        if (!data || size == 0) return nullptr;
+
         // Получаем информацию об изображении
         int nComponents;
         nvjpegChromaSubsampling_t subsampling;
         int widths[NVJPEG_MAX_COMPONENT], heights[NVJPEG_MAX_COMPONENT];
 
-        if (nvjpegGetImageInfo(handle_, jpegData.data(), jpegData.size(),
+        if (nvjpegGetImageInfo(handle_, data, size,
             &nComponents, &subsampling, widths, heights) != NVJPEG_STATUS_SUCCESS)
             return nullptr;
 
@@ -92,7 +98,7 @@ public:
         output.pitch[0] = static_cast<unsigned int>(bgrPitch);
 
         // Декодируем в BGRI формат
-        auto status = nvjpegDecode(handle_, state_, jpegData.data(), jpegData.size(),
+        auto status = nvjpegDecode(handle_, state_, data, size,
             NVJPEG_OUTPUT_BGRI, &output, stream_);
 
         if (status != NVJPEG_STATUS_SUCCESS) {

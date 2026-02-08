@@ -145,6 +145,7 @@
     <ClInclude Include="ImageDecoder.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
+    <ClInclude Include="ZipArchive.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="FolderView.cpp" />
@@ -152,6 +153,7 @@
     <ClCompile Include="ImageDecoderFactory.cpp" />
     <ClCompile Include="NvJpegDecoder.cpp" />
     <ClCompile Include="WicDecoder.cpp" />
+    <ClCompile Include="ZipArchive.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="FolderView.rc" />
@@ -162,9 +164,11 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="ImageDecoders.props" />
+    <None Include="Zlib.props" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="ImageDecoders.props" Condition="Exists('ImageDecoders.props')" />
+  <Import Project="Zlib.props" Condition="Exists('Zlib.props')" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
