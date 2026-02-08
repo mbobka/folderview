@@ -438,7 +438,7 @@ void SetCurrentImage0(HWND hWnd, int imageIndex) {
 		OutputDebugStringW(debugMsg.str().c_str());
 
 		// Очищаем дальний кеш для экономии памяти
-		const size_t cache_epsilon = 20;
+		const size_t cache_epsilon = 50;
 		for (size_t i = 0; i + cache_epsilon < current_image; i++) {
 			decodedImagesCache[i].reset();
 		}
@@ -676,7 +676,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
 
 	D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
-		D2D1_RENDER_TARGET_TYPE_HARDWARE,  // Принудительно GPU
+		D2D1_RENDER_TARGET_TYPE_HARDWARE,
 		D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
 		96.0f, 96.0f
 	);
@@ -684,7 +684,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, PSTR, INT iCmdShow)
 	D2D1_HWND_RENDER_TARGET_PROPERTIES hwndRtProps = D2D1::HwndRenderTargetProperties(
 		hWnd,
 		size,
-		D2D1_PRESENT_OPTIONS_IMMEDIATELY  // Без VSync для максимальной скорости
+		D2D1_PRESENT_OPTIONS_IMMEDIATELY
 	);
 
 	hr = g_pD2DFactory->CreateHwndRenderTarget(rtProps, hwndRtProps, &g_pRenderTarget);
