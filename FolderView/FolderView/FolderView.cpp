@@ -75,6 +75,13 @@ static bool is_file_has_right_extension_for_us(std::filesystem::path const& file
     return false;
 }
 
+static bool compare_files_by_name(const std::filesystem::path& a, const std::filesystem::path& b) {
+    auto r = lstrcmpiW(a.stem().c_str(), b.stem().c_str());
+    if (r != 0)
+        return r < 0;
+    return lstrcmpiW(a.filename().c_str(), b.filename().c_str()) < 0;
+}
+
 static HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
 {
     *ppv = NULL;
@@ -126,9 +133,7 @@ static void BuildFilesList(std::filesystem::path const& file_or_folder)
         files.push_back(entryx.path());
     }
 
-    std::sort(files.begin(), files.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
-            return lstrcmpiW(a.c_str(), b.c_str()) < 0;
-        });
+    std::sort(files.begin(), files.end(), compare_files_by_name);
 
     decodedImagesCache.resize(files.size());
 }
@@ -159,9 +164,7 @@ static void BuildFilesListFromZip(const std::wstring& zipPath)
         files.push_back(std::filesystem::path(imageName));
     }
 
-    std::sort(files.begin(), files.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
-            return lstrcmpiW(a.c_str(), b.c_str()) < 0;
-        });
+    std::sort(files.begin(), files.end(), compare_files_by_name);
 
     decodedImagesCache.resize(files.size());
 
@@ -204,9 +207,7 @@ static void SwitchToZipFile(HWND hWnd, int direction)
             zipFiles.push_back(entry.path());
     }
 
-    std::sort(zipFiles.begin(), zipFiles.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
-            return lstrcmpiW(a.c_str(), b.c_str()) < 0;
-        });
+    std::sort(zipFiles.begin(), zipFiles.end(), compare_files_by_name);
 
     // Находим текущий архив в списке
     auto normalizedCurrent = currentZipPath.lexically_normal();
