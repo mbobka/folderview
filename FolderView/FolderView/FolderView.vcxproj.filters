@@ -63,6 +63,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="ImageDecoders.props" />
-    <None Include="Zlib.props" />
+    <None Include="Packages.props" />
   </ItemGroup>
 </Project>

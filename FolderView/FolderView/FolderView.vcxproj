@@ -164,11 +164,11 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="ImageDecoders.props" />
-    <None Include="Zlib.props" />
+    <None Include="Packages.props" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Import Project="ImageDecoders.props" Condition="Exists('ImageDecoders.props')" />
-  <Import Project="Zlib.props" Condition="Exists('Zlib.props')" />
+  <Import Project="ImageDecoders.props" />
+  <Import Project="Packages.props" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
