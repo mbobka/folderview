@@ -64,5 +64,4 @@ public:
 
 // Фабричные функции для создания декодеров
 std::unique_ptr<IImageDecoder> CreateNvJpegDecoder();
-std::unique_ptr<IImageDecoder> CreateIppJpegDecoder();
 std::unique_ptr<IImageDecoder> CreateWicDecoder();  // Для всех остальных форматов
