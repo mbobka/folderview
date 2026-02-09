@@ -148,8 +148,8 @@
     <ClInclude Include="ZipArchive.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="FolderView.cpp" />
     <ClCompile Include="AlmostEquals.h" />
+    <ClCompile Include="FolderView.cpp" />
     <ClCompile Include="ImageDecoderFactory.cpp" />
     <ClCompile Include="NvJpegDecoder.cpp" />
     <ClCompile Include="WicDecoder.cpp" />

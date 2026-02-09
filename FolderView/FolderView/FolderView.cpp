@@ -186,6 +186,71 @@ static void BuildExtensionsList()
 	extensions.push_back(L".heic");
 }
 
+static void SwitchToZipFile(HWND hWnd, int direction)
+{
+	if (block_changing_of_current_image)
+		return;
+
+	std::filesystem::path currentZipPath(ZipArchiveManager::Instance().GetArchivePath());
+	std::filesystem::path parentDir = currentZipPath.parent_path();
+
+	// Собираем все ZIP-файлы в той же папке
+	std::vector<std::filesystem::path> zipFiles;
+	for (auto& entry : std::filesystem::directory_iterator(parentDir))
+	{
+		if (!entry.is_regular_file())
+			continue;
+		if (IsZipFile(entry.path()))
+			zipFiles.push_back(entry.path());
+	}
+
+	std::sort(zipFiles.begin(), zipFiles.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return lstrcmpiW(a.c_str(), b.c_str()) < 0;
+		});
+
+	// Находим текущий архив в списке
+	auto normalizedCurrent = currentZipPath.lexically_normal();
+	size_t currentIndex = 0;
+	bool found = false;
+	for (size_t i = 0; i < zipFiles.size(); i++) {
+		if (zipFiles[i].lexically_normal() == normalizedCurrent) {
+			currentIndex = i;
+			found = true;
+			break;
+		}
+	}
+
+	if (!found)
+		return;
+
+	size_t newIndex;
+	if (direction < 0) {
+		if (currentIndex == 0)
+			return;
+		newIndex = currentIndex - 1;
+	}
+	else {
+		if (currentIndex + 1 >= zipFiles.size())
+			return;
+		newIndex = currentIndex + 1;
+	}
+
+	// Закрываем текущий архив и очищаем состояние
+	ZipArchiveManager::Instance().Close();
+	files.clear();
+	decodedImagesCache.clear();
+	current_image = 0;
+	g_isZipMode = false;
+	image_shift.reset();
+
+	// Открываем новый ZIP
+	BuildFilesListFromZip(zipFiles[newIndex].wstring());
+
+	if (!files.empty()) {
+		SetCurrentImage(hWnd);
+	}
+}
+
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 
@@ -218,8 +283,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 			[[fallthrough]];
 		case VK_NUMPAD8:
-		case VK_PRIOR:
 			PreviousImage(hWnd);
+			return 0;
+
+		case VK_PRIOR:
+			if (g_isZipMode)
+				SwitchToZipFile(hWnd, -1);
+			else
+				PreviousImage(hWnd);
 			return 0;
 
 		case VK_NUMPAD7:
@@ -250,8 +321,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 			[[fallthrough]];
 		case VK_NUMPAD2:
-		case VK_NEXT:
 			NextImage(hWnd);
+			return 0;
+
+		case VK_NEXT:
+			if (g_isZipMode)
+				SwitchToZipFile(hWnd, 1);
+			else
+				NextImage(hWnd);
 			return 0;
 
 		case VK_ADD:
