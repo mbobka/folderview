@@ -278,11 +278,22 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         auto vkey = static_cast<UINT8>(wParam);
 
         switch (vkey) {
+        case VK_LEFT:
+            PreviousImage(hWnd);
+            return 0;
+
+        case VK_RIGHT:
+            NextImage(hWnd);
+            return 0;
+
         case VK_UP:
             if (GetKeyState(VK_CONTROL) & 0x8000)
                 goto scale_up;
 
-            [[fallthrough]];
+            if (g_isZipMode)
+                SwitchToZipFile(hWnd, -1);
+            return 0;
+
         case VK_NUMPAD8:
             PreviousImage(hWnd);
             return 0;
@@ -320,7 +331,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             if (GetKeyState(VK_CONTROL) & 0x8000)
                 goto scale_down;
 
-            [[fallthrough]];
+            if (g_isZipMode)
+                SwitchToZipFile(hWnd, 1);
+            return 0;
+
         case VK_NUMPAD2:
             NextImage(hWnd);
             return 0;
