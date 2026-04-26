@@ -1,28 +1,148 @@
-name: MSBuild
+name: Release
 
-on: [push]
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix"
+        required: true
+        default: "1.0.0"
+
+permissions:
+  contents: write
 
 env:
-  # Path to the solution file relative to the root of the project.
   SOLUTION_FILE_PATH: FolderView/FolderView.sln
-
-  # Configuration type to build.
-  # You can convert this to a build matrix if you need coverage of multiple configuration types.
-  # https://docs.github.com/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
   BUILD_CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+  PACKAGE_ID: mbobka.FolderView
+  COMMAND_ALIAS: fview
 
 jobs:
-  build:
+  build-release:
     runs-on: windows-2025-vs2026
 
     steps:
-    - uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.0.2
+      - name: Resolve version
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ github.event.inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
 
-    - name: Build
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      # Add additional options to the MSBuild command line here (like platform or verbosity level).
-      # See https://docs.microsoft.com/visualstudio/msbuild/msbuild-command-line-reference
-      run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} ${{env.SOLUTION_FILE_PATH}} /p:VcpkgTriplet=x64-windows /p:VcpkgEnableManifest=true
+          if ($version -notmatch "^\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?$") {
+            throw "Version '$version' must look like 1.0.0 or 1.0.0-preview.1"
+          }
+
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TAG=v$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_NAME=FolderView-$version-win-x64.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_name=FolderView-$version-win-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        run: >
+          msbuild /m
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }}
+          /p:Platform=${{ env.BUILD_PLATFORM }}
+          /p:VcpkgTriplet=x64-windows
+          /p:VcpkgEnableManifest=true
+          ${{ env.SOLUTION_FILE_PATH }}
+
+      - name: Package portable zip
+        id: package
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "FolderView\x64\Release"
+          $stageDir = Join-Path $env:RUNNER_TEMP "FolderView-package"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE $env:ZIP_NAME
+          $shaPath = "$zipPath.sha256"
+
+          if (Test-Path $stageDir) {
+            Remove-Item -Recurse -Force $stageDir
+          }
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+
+          Copy-Item (Join-Path $releaseDir "FolderView.exe") $stageDir
+          Copy-Item (Join-Path $releaseDir "zlib1.dll") $stageDir
+
+          if (Test-Path $zipPath) {
+            Remove-Item -Force $zipPath
+          }
+          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+          "$hash  $env:ZIP_NAME" | Out-File -FilePath $shaPath -Encoding ascii
+          "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHA_PATH=$shaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha_path=$shaPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Validate package contents
+        shell: pwsh
+        run: |
+          $entries = tar -tf $env:ZIP_PATH
+          $required = @("FolderView.exe", "zlib1.dll")
+          $forbidden = @("FolderView.pdb", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+
+          foreach ($file in $required) {
+            if ($entries -notcontains $file) {
+              throw "Package is missing required file: $file"
+            }
+          }
+
+          foreach ($file in $forbidden) {
+            if ($entries -contains $file) {
+              throw "Package contains forbidden file: $file"
+            }
+          }
+
+      - name: Write release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $notesPath = Join-Path $env:GITHUB_WORKSPACE "RELEASE_NOTES.md"
+          @(
+            "FolderView $env:VERSION"
+            ""
+            "Lightweight image viewer for folders, ZIP/CBZ archives, JPEG, PNG, and WebP files."
+            ""
+            "- WinGet package id: ``$env:PACKAGE_ID``"
+            "- Command alias: ``$env:COMMAND_ALIAS``"
+            "- SHA256: ``$env:ZIP_SHA256``"
+          ) | Out-File -FilePath $notesPath -Encoding utf8
+          "RELEASE_NOTES=$notesPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "release_notes=$notesPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolderView-${{ steps.meta.outputs.version }}-win-x64
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.sha_path }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: FolderView ${{ steps.meta.outputs.version }}
+          body_path: ${{ steps.notes.outputs.release_notes }}
+          files: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.sha_path }}
