@@ -53,6 +53,27 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
+      - name: Stamp version resource
+        shell: pwsh
+        run: |
+          $match = [regex]::Match($env:VERSION, "^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)")
+          if (-not $match.Success) {
+            throw "Version '$env:VERSION' must start with major.minor.patch"
+          }
+
+          $fileVersion = "$($match.Groups["major"].Value),$($match.Groups["minor"].Value),$($match.Groups["patch"].Value),0"
+          $rcPath = Join-Path $env:GITHUB_WORKSPACE "FolderView\FolderView\FolderView.rc"
+          $encoding = [System.Text.Encoding]::Unicode
+          $text = [System.IO.File]::ReadAllText($rcPath, $encoding)
+
+          $text = [regex]::Replace($text, "FILEVERSION\s+\d+,\d+,\d+,\d+", "FILEVERSION $fileVersion")
+          $text = [regex]::Replace($text, "PRODUCTVERSION\s+\d+,\d+,\d+,\d+", "PRODUCTVERSION $fileVersion")
+          $text = [regex]::Replace($text, 'VALUE "FileVersion", "[^"]*\\0"', "VALUE `"FileVersion`", `"$env:VERSION\0`"")
+          $text = [regex]::Replace($text, 'VALUE "ProductVersion", "[^"]*\\0"', "VALUE `"ProductVersion`", `"$env:VERSION\0`"")
+          $text = [regex]::Replace($text, 'LTEXT\s+"FolderView, Version [^"]+"', "LTEXT `"FolderView, Version $env:VERSION`"")
+
+          [System.IO.File]::WriteAllText($rcPath, $text, $encoding)
+
       - name: Build
         run: >
           msbuild /m
