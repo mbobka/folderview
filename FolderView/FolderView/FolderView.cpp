@@ -815,6 +815,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         BuildFilesList(root);
     }
 
+    if (files.empty()) {
+        if (g_isZipMode) {
+            ZipArchiveManager::Instance().Close();
+        }
+
+        ImageDecoderChain::Shutdown();
+        OleUninitialize();
+        return 0;
+    }
+
 
     HBRUSH background = CreateSolidBrush(RGB(169, 169, 169)); // DarkGray
 
