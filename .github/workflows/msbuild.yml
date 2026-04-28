@@ -141,7 +141,7 @@ jobs:
           @(
             "FolderView $env:VERSION"
             ""
-            "Lightweight image viewer for folders, ZIP/CBZ archives, JPEG, PNG, and WebP files."
+            "Lightweight image viewer for folders, ZIP archives, JPEG, PNG, and WebP files."
             ""
             "- WinGet package id: ``$env:PACKAGE_ID``"
             "- Command alias: ``$env:COMMAND_ALIAS``"
