@@ -38,7 +38,6 @@ using Microsoft::WRL::ComPtr;
 
 void BuildExtensionsList();
 void BuildFilesList(std::filesystem::path const& file_or_folder);
-void BuildFilesListFromZip(const std::wstring& zipPath);
 bool IsZipFile(const std::filesystem::path& path);
 void PreviousImage(HWND hWnd);
 void NextImage(HWND hWnd);
@@ -145,10 +144,10 @@ static bool IsZipFile(const std::filesystem::path& path)
     return ext == L".zip";
 }
 
-static void BuildFilesListFromZip(const std::wstring& zipPath)
+static void BuildFilesListFromZip(const std::wstring& zipPath, const std::wstring& startEntry = L"")
 {
     auto& zipManager = ZipArchiveManager::Instance();
-    
+
     if (!zipManager.OpenAsVirtualFolder(zipPath)) {
         MessageBox(NULL, L"Не удалось открыть ZIP-архив", L"Folder view", MB_OK | MB_ICONERROR);
         return;
@@ -158,7 +157,7 @@ static void BuildFilesListFromZip(const std::wstring& zipPath)
 
     // Получаем список изображений из архива
     auto imageFiles = zipManager.GetImageFiles(extensions);
-    
+
     for (const auto& imageName : imageFiles) {
         // Сохраняем имя файла в архиве как путь
         files.push_back(std::filesystem::path(imageName));
@@ -168,9 +167,56 @@ static void BuildFilesListFromZip(const std::wstring& zipPath)
 
     decodedImagesCache.resize(files.size());
 
+    if (!startEntry.empty()) {
+        // Внутри ZIP пути хранятся со слэшами; принимаем оба разделителя.
+        std::wstring normalized = startEntry;
+        std::replace(normalized.begin(), normalized.end(), L'\\', L'/');
+
+        for (size_t i = 0; i < files.size(); i++) {
+            auto entryPath = files[i].wstring();
+            std::replace(entryPath.begin(), entryPath.end(), L'\\', L'/');
+            if (lstrcmpiW(entryPath.c_str(), normalized.c_str()) == 0) {
+                current_image = i;
+                break;
+            }
+        }
+    }
+
     wchar_t msg[256];
     swprintf_s(msg, L"[ZIP] Found %zu images in archive\n", files.size());
     OutputDebugStringW(msg);
+}
+
+// Если путь имеет вид <archive>.zip\<inner>, разбивает его на (archive, inner).
+// Возвращает true, если zip-предок найден и существует на диске.
+static bool TrySplitZipVirtualPath(const std::filesystem::path& input,
+                                   std::filesystem::path& zipPath,
+                                   std::wstring& innerEntry)
+{
+    std::filesystem::path current = input;
+    std::filesystem::path tail;
+
+    while (current.has_relative_path() && current != current.root_path()) {
+        if (IsZipFile(current)) {
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(current, ec)) {
+                zipPath = current;
+                innerEntry = tail.wstring();
+                return true;
+            }
+        }
+
+        auto parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+
+        // Накапливаем хвост от zip-архива до листа.
+        tail = tail.empty() ? current.filename() : current.filename() / tail;
+        current = parent;
+    }
+
+    return false;
 }
 
 static void BuildExtensionsList()
@@ -806,9 +852,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     BuildExtensionsList();
 
     auto root = parameters.size() == 1 ? std::filesystem::path(parameters[0]) : std::filesystem::current_path();
-    
-    // Проверяем, является ли путь ZIP-файлом
-    if (IsZipFile(root)) {
+
+    // Виртуальный путь вида <archive>.zip\<inner_file> — открываем архив со стартом на inner_file.
+    std::filesystem::path zipRoot;
+    std::wstring innerEntry;
+    if (TrySplitZipVirtualPath(root, zipRoot, innerEntry)) {
+        BuildFilesListFromZip(zipRoot.wstring(), innerEntry);
+    }
+    else if (IsZipFile(root)) {
         BuildFilesListFromZip(root.wstring());
     }
     else {
