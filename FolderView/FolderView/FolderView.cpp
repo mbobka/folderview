@@ -9,7 +9,6 @@
 #include <shellapi.h>
 #include <objidl.h>
 #include <shlobj.h>
-#include <atlbase.h>
 #include <VersionHelpers.h>
 
 // Direct2D
@@ -436,10 +435,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                     return 0;
                 }
                 
-                CComPtr<IDataObject> spdto;
+                ComPtr<IDataObject> spdto;
 
                 if (FAILED(GetUIObjectOfFile(nullptr, files[current_image].c_str(), IID_PPV_ARGS(&spdto))) ||
-                    FAILED(OleSetClipboard(spdto)) ||
+                    FAILED(OleSetClipboard(spdto.Get())) ||
                     FAILED(OleFlushClipboard()))
                 {
                     MessageBeep(MB_ICONERROR);
