@@ -1,67 +1,47 @@
 #pragma once
 
-#include <memory>
-#include <vector>
-#include <string>
-#include <cstdint>
 #include <windows.h>
 
-// Декодированное изображение в формате BGRA (совместимо с D2D)
-struct DecodedImage {
-    std::vector<uint8_t> pixels;
-    int width = 0;
-    int height = 0;
-    int stride = 0;
-    int bitsPerPixel = 32;
-    bool hasAlpha = false;  // true для PNG/GIF с прозрачностью
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-    bool IsValid() const { return !pixels.empty() && width > 0 && height > 0; }
-};
+// Декодированное изображение в 32-битном premultiplied BGRA.
+// Память pixels принадлежит структуре и выделяется из кучи процесса.
+typedef struct DecodedImage {
+    BYTE* pixels;
+    SIZE_T pixels_size;
+    UINT width;
+    UINT height;
+    UINT stride;
+    BOOL has_alpha;
+} DecodedImage;
 
-// Абстрактный декодер изображений
-class IImageDecoder {
-public:
-    virtual ~IImageDecoder() = default;
-    
-    // Проверяет, может ли декодер обработать файл по расширению
-    virtual bool CanDecode(const wchar_t* path) const = 0;
-    
-    // Декодирует изображение из файла
-    virtual std::unique_ptr<DecodedImage> Decode(const wchar_t* path) = 0;
-    
-    // Декодирует изображение из памяти (для ZIP)
-    virtual std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint) = 0;
-    
-    // Проверяет доступность декодера (библиотека загружена, GPU есть и т.д.)
-    virtual bool IsAvailable() const = 0;
-    
-    // Имя декодера для отладки
-    virtual const wchar_t* Name() const = 0;
-};
+// Инициализирует COM на текущем потоке и создаёт WIC-фабрику.
+// Initialize и Shutdown должны вызываться на одном и том же потоке.
+HRESULT ImageDecoder_Initialize(void);
 
-// Цепочка декодеров с автоматическим fallback
-class ImageDecoderChain {
-    std::vector<std::unique_ptr<IImageDecoder>> decoders_;
-    
-    ImageDecoderChain() = default;
-public:
-    static ImageDecoderChain& Instance();
-    
-    void AddDecoder(std::unique_ptr<IImageDecoder> decoder);
-    
-    // Декодирует файл, пробуя декодеры по приоритету
-    std::unique_ptr<DecodedImage> Decode(const wchar_t* path);
-    
-    // Декодирует из памяти (для ZIP)
-    std::unique_ptr<DecodedImage> DecodeFromMemory(const uint8_t* data, size_t size, const wchar_t* hint);
-    
-    // Инициализирует цепочку декодеров
-    static void Initialize();
-    
-    // Освобождает ресурсы
-    static void Shutdown();
-};
+// Освобождает WIC-фабрику и балансирует инициализацию COM.
+void ImageDecoder_Shutdown(void);
 
-// Фабричные функции для создания декодеров
-std::unique_ptr<IImageDecoder> CreateNvJpegDecoder();
-std::unique_ptr<IImageDecoder> CreateWicDecoder();  // Для всех остальных форматов
+// Декодирует первый кадр файла через WIC.
+// Перед первым вызовом out_image должен быть обнулён. При успехе ранее
+// принадлежавший out_image буфер освобождается и заменяется новым.
+HRESULT ImageDecoder_DecodeFile(LPCWSTR path, DecodedImage* out_image);
+
+// Декодирует первый кадр из памяти через WIC.
+// Размер ограничен UINT_MAX из-за контракта SHCreateMemStream.
+HRESULT ImageDecoder_DecodeMemory(
+    const BYTE* data,
+    SIZE_T data_size,
+    DecodedImage* out_image);
+
+// Проверяет наличие непустого согласованного BGRA-буфера.
+BOOL DecodedImage_IsValid(const DecodedImage* image);
+
+// Освобождает pixels через HeapFree и обнуляет все поля структуры.
+void DecodedImage_Free(DecodedImage* image);
+
+#ifdef __cplusplus
+}
+#endif

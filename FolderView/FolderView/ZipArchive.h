@@ -1,84 +1,65 @@
 #pragma once
 
 #include <windows.h>
-#include <vector>
-#include <string>
-#include <memory>
-#include <cstdint>
-#include <fstream>
 
-// Структура для описания файла в ZIP-архиве
-struct ZipEntry {
-    std::wstring name;
-    uint64_t compressedSize;
-    uint64_t uncompressedSize;
-    uint64_t localHeaderOffset;
-    uint16_t compressionMethod;
-    bool isDirectory;
-};
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Чтение ZIP-архива без распаковки на диск
-class ZipArchive {
-public:
-    ZipArchive();
-    ~ZipArchive();
+/*
+ * ZIP-архив читается только через WinAPI и хранит всю свою память в process heap.
+ * Структуру ZipArchive перед первым использованием необходимо инициализировать
+ * через ZipArchive_Init. Объект не является потокобезопасным.
+ */
 
-    // Открыть ZIP-файл
-    bool Open(const std::wstring& path);
-    
-    // Закрыть архив
-    void Close();
+#define ZIP_DEFAULT_MAX_EXTRACTED_SIZE (512ULL * 1024ULL * 1024ULL)
 
-    // Проверка, открыт ли архив
-    bool IsOpen() const { return isOpen_; }
+typedef struct ZipEntry {
+    WCHAR* name;
+    ULONGLONG compressed_size;
+    ULONGLONG uncompressed_size;
+    ULONGLONG local_header_offset;
+    WORD compression_method;
+    WORD flags;
+} ZipEntry;
 
-    // Получить список файлов
-    const std::vector<ZipEntry>& GetEntries() const { return entries_; }
+typedef struct ZipArchive {
+    HANDLE file;
+    WCHAR* path;
+    ZipEntry* entries;
+    SIZE_T entry_count;
+    SIZE_T entry_capacity;
+    ULONGLONG file_size;
+    ULONGLONG central_directory_offset;
+    ULONGLONG central_directory_size;
+    DWORD state_cookie;
+} ZipArchive;
 
-    // Извлечь файл в память
-    bool ExtractToMemory(const ZipEntry& entry, std::vector<uint8_t>& outData);
+/* Жизненный цикл архива. */
+void ZipArchive_Init(ZipArchive* archive);
+BOOL ZipArchive_Open(ZipArchive* archive, LPCWSTR path);
+void ZipArchive_Close(ZipArchive* archive);
+BOOL ZipArchive_IsOpen(const ZipArchive* archive);
+LPCWSTR ZipArchive_Path(const ZipArchive* archive);
 
-    // Путь к архиву
-    const std::wstring& GetPath() const { return archivePath_; }
+/* Записи принадлежат архиву и становятся недействительными после Close/Open. */
+SIZE_T ZipArchive_EntryCount(const ZipArchive* archive);
+const ZipEntry* ZipArchive_EntryAt(const ZipArchive* archive, SIZE_T index);
+LPCWSTR ZipEntry_Name(const ZipEntry* entry);
 
-private:
-    bool ReadCentralDirectory();
-    bool Inflate(const uint8_t* compressedData, uint64_t compressedSize,
-                 uint8_t* uncompressedData, uint64_t uncompressedSize);
+/*
+ * Извлекает entry в process heap. При max_output_bytes == 0 применяется
+ * ZIP_DEFAULT_MAX_EXTRACTED_SIZE. Для пустого файла data == NULL допустим.
+ * Полученный буфер освобождается через ZipArchive_FreeBuffer.
+ */
+BOOL ZipArchive_ExtractEntry(
+    ZipArchive* archive,
+    const ZipEntry* entry,
+    ULONGLONG max_output_bytes,
+    BYTE** data,
+    SIZE_T* size);
+void ZipArchive_FreeBuffer(void* data);
 
-    std::wstring archivePath_;
-    std::vector<ZipEntry> entries_;
-    HANDLE fileHandle_ = INVALID_HANDLE_VALUE;
-    HANDLE fileMapping_ = nullptr;
-    const uint8_t* mappedData_ = nullptr;
-    uint64_t fileSize_ = 0;
-    bool isOpen_ = false;
-};
-
-// Глобальный экземпляр открытого ZIP-архива
-class ZipArchiveManager {
-public:
-    static ZipArchiveManager& Instance();
-    
-    // Открыть ZIP как виртуальную папку
-    bool OpenAsVirtualFolder(const std::wstring& zipPath);
-    
-    // Закрыть текущий архив
-    void Close();
-    
-    // Проверить, работаем ли мы с ZIP
-    bool IsZipMode() const { return archive_ && archive_->IsOpen(); }
-    
-    // Получить список изображений из архива
-    std::vector<std::wstring> GetImageFiles(const std::vector<std::wstring>& extensions);
-    
-    // Извлечь изображение в память
-    bool ExtractImage(const std::wstring& entryName, std::vector<uint8_t>& outData);
-    
-    // Путь к архиву
-    std::wstring GetArchivePath() const;
-
-private:
-    ZipArchiveManager() = default;
-    std::unique_ptr<ZipArchive> archive_;
-};
+#ifdef __cplusplus
+}
+#endif

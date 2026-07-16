@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1
+#
+# Кросс-сборка FolderView под windows-amd64 в Linux-контейнере.
+# Тулчейн: clang-cl + lld-link + llvm-rc, Windows SDK берётся через xwin.
+# Приложение и zlib собираются как freestanding C без MSVC/UCRT.
+
+# Фиксируем Clang 19 из официального репозитория apt.llvm.org, чтобы локальные
+# и CI-сборки использовали один и тот же воспроизводимый тулчейн.
+ARG LLVM_VERSION=19
+ARG XWIN_VERSION=0.6.5
+ARG ZLIB_VERSION=1.3.2
+
+FROM ubuntu:24.04 AS toolchain
+
+ARG LLVM_VERSION
+ARG XWIN_VERSION
+ARG ZLIB_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/usr/lib/llvm-${LLVM_VERSION}/bin:${PATH}"
+
+# Базовые утилиты
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg xz-utils tar python3 zip unzip libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Windows SDK + CRT (заголовки и библиотеки) через xwin.
+# Делаем это до установки clang, чтобы правки тулчейна не сбрасывали кеш SDK.
+RUN set -eux; \
+    curl -fsSL -o /tmp/xwin.tar.gz \
+        "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VERSION}/xwin-${XWIN_VERSION}-x86_64-unknown-linux-musl.tar.gz"; \
+    mkdir -p /tmp/xwin; \
+    tar -xzf /tmp/xwin.tar.gz -C /tmp/xwin --strip-components=1; \
+    /tmp/xwin/xwin --accept-license --arch x86_64 splat --output /xwin; \
+    rm -rf /tmp/xwin /tmp/xwin.tar.gz /xwin/.xwin-cache; \
+    ln -sf sdkddkver.h /xwin/sdk/include/shared/SDKDDKVer.h
+
+# Тулчейн LLVM/Clang из apt.llvm.org. Пакеты ставят версионные бинарники
+# (clang-19, lld-link-19, ...) — заводим симлинки без суффикса. clang-cl
+# отдельно не ставится: это тот же clang, переключающийся в MSVC-режим по
+# имени исполняемого файла.
+RUN set -eux; \
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_VERSION} main" \
+        > /etc/apt/sources.list.d/llvm.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        "clang-${LLVM_VERSION}" "lld-${LLVM_VERSION}" "llvm-${LLVM_VERSION}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf "/usr/bin/clang-${LLVM_VERSION}"     /usr/local/bin/clang; \
+    ln -sf "/usr/bin/clang-${LLVM_VERSION}"     /usr/local/bin/clang-cl; \
+    ln -sf "/usr/bin/lld-link-${LLVM_VERSION}"  /usr/local/bin/lld-link; \
+    ln -sf "/usr/bin/llvm-rc-${LLVM_VERSION}"   /usr/local/bin/llvm-rc; \
+    ln -sf "/usr/bin/llvm-lib-${LLVM_VERSION}"  /usr/local/bin/llvm-lib; \
+    ln -sf "/usr/bin/llvm-readobj-${LLVM_VERSION}" /usr/local/bin/llvm-readobj
+
+# Для ZIP нужен только inflate. Z_SOLO убирает stdio и CRT-аллокатор:
+# приложение передаёт zlib колбэки HeapAlloc/HeapFree.
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSL -o zlib.tar.gz \
+        "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"; \
+    echo "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16  zlib.tar.gz" | sha256sum -c -; \
+    tar -xzf zlib.tar.gz; \
+    cd "zlib-${ZLIB_VERSION}"; \
+    mkdir -p /opt/zlib/include; \
+    cp zlib.h zconf.h /opt/zlib/include/; \
+    for f in adler32 crc32 inffast inflate inftrees zutil; do \
+        clang-cl --target=x86_64-pc-windows-msvc /nologo /c /TC /Zl /GS- /O2 \
+            /DNDEBUG /DZ_SOLO /DNO_GZIP /clang:-ffreestanding \
+            /imsvc /xwin/crt/include \
+            /imsvc /xwin/sdk/include/ucrt \
+            /imsvc /xwin/sdk/include/shared \
+            /imsvc /xwin/sdk/include/um \
+            "$f.c" "/Fo$f.obj"; \
+    done; \
+    llvm-lib /nologo /out:/opt/zlib/zlibstatic.lib \
+        adler32.obj crc32.obj inffast.obj inflate.obj inftrees.obj zutil.obj; \
+    rm -rf /tmp/zlib.tar.gz "/tmp/zlib-${ZLIB_VERSION}"
+
+FROM toolchain AS build
+
+ARG CONFIGURATION=Release
+ARG VERSION=
+ARG ZIP_NAME=
+
+ENV CONFIGURATION=${CONFIGURATION} \
+    VERSION=${VERSION} \
+    ZIP_NAME=${ZIP_NAME} \
+    SRC_ROOT=/src/FolderView \
+    OUT_DIR=/out \
+    XWIN_DIR=/xwin \
+    ZLIB_DIR=/opt/zlib
+
+WORKDIR /src
+COPY FolderView /src/FolderView
+COPY build/build-xwin.sh /build/build-xwin.sh
+
+RUN chmod +x /build/build-xwin.sh && /build/build-xwin.sh
+
+FROM scratch AS artifacts
+COPY --from=build /out/ /

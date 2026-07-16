@@ -1,8 +1,0 @@
-{
-  "name": "folderview",
-  "version-string": "1.0.2",
-  "dependencies": [
-    "zlib"
-  ],
-  "builtin-baseline": "aa2d37682e3318d93aef87efa7b0e88e81cd3d59"
-}
