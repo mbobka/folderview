@@ -38,17 +38,25 @@ fview <path>
 | `Esc` | Exit |
 | Left mouse drag | Pan the image |
 
-## Build
+## Build with Docker
 
-FolderView is a native Windows C++ application built with Visual Studio/MSBuild and vcpkg.
+FolderView is written in freestanding C and cross-compiled for windows-amd64 inside a **Linux** Docker container. The toolchain is `clang-cl` + `lld-link` + `llvm-rc`; Windows SDK headers and import libraries are fetched with [xwin](https://github.com/Jake-Shadle/xwin). The host machine only needs the source tree, Docker Desktop in Linux containers mode, and the exported binaries.
 
 ```powershell
-msbuild /m /p:Configuration=Release /p:Platform=x64 FolderView/FolderView.sln /p:VcpkgTriplet=x64-windows /p:VcpkgEnableManifest=true
+.\build\Invoke-DockerBuild.ps1
 ```
 
-Release builds include `FolderView.exe` and the app-local `zlib1.dll`. The Microsoft Visual C++ runtime is provided by the WinGet package dependency `Microsoft.VCRedist.2015+.x64`.
+The output is written to `out-win-amd64\` and includes `FolderView.exe`, a portable ZIP, and a SHA256 file. The required `inflate` sources from zlib are compiled in `Z_SOLO` mode with WinAPI heap callbacks, so no `zlib1.dll` is shipped. The first build downloads the Windows SDK and toolchain, so it takes longer than later cached builds.
 
-GitHub Actions release builds are created from `v*` tags. The workflow stamps `FolderView.rc` from the tag version before building, so `v1.2.3` produces `FileVersion` and `ProductVersion` `1.2.3`.
+To stamp a release version inside the container:
+
+```powershell
+.\build\Invoke-DockerBuild.ps1 -Version 1.2.3
+```
+
+The executable has its own entry point and is linked with `/NODEFAULTLIB`. It does not use MSVCP, VCRUNTIME, or UCRT; its runtime imports are Windows system DLLs only.
+
+GitHub Actions release builds are created from `v*` tags and run on a Linux runner. The Docker build stamps `FolderView.rc` from the tag version inside the container, so `v1.2.3` produces `FileVersion` and `ProductVersion` `1.2.3`.
 
 ## License
 

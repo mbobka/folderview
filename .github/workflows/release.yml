@@ -15,15 +15,15 @@ permissions:
   contents: write
 
 env:
-  SOLUTION_FILE_PATH: FolderView/FolderView.sln
   BUILD_CONFIGURATION: Release
   BUILD_PLATFORM: x64
   PACKAGE_ID: mbobka.FolderView
   COMMAND_ALIAS: fview
+  OUTPUT_DIR: out-win-amd64
 
 jobs:
   build-release:
-    runs-on: windows-2025-vs2026
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -50,88 +50,39 @@ jobs:
           "release_tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "zip_name=FolderView-$version-win-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Stamp version resource
+      - name: Build and package in Docker
         shell: pwsh
         run: |
-          $match = [regex]::Match($env:VERSION, "^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)")
-          if (-not $match.Success) {
-            throw "Version '$env:VERSION' must start with major.minor.patch"
-          }
+          .\build\Invoke-DockerBuild.ps1 `
+            -Configuration $env:BUILD_CONFIGURATION `
+            -Platform $env:BUILD_PLATFORM `
+            -Version $env:VERSION `
+            -ZipName $env:ZIP_NAME `
+            -OutputDir $env:OUTPUT_DIR
 
-          $fileVersion = "$($match.Groups["major"].Value),$($match.Groups["minor"].Value),$($match.Groups["patch"].Value),0"
-          $rcPath = Join-Path $env:GITHUB_WORKSPACE "FolderView\FolderView\FolderView.rc"
-          $encoding = [System.Text.Encoding]::Unicode
-          $text = [System.IO.File]::ReadAllText($rcPath, $encoding)
-
-          $text = [regex]::Replace($text, "FILEVERSION\s+\d+,\d+,\d+,\d+", "FILEVERSION $fileVersion")
-          $text = [regex]::Replace($text, "PRODUCTVERSION\s+\d+,\d+,\d+,\d+", "PRODUCTVERSION $fileVersion")
-          $text = [regex]::Replace($text, 'VALUE "FileVersion", "[^"]*\\0"', "VALUE `"FileVersion`", `"$env:VERSION\0`"")
-          $text = [regex]::Replace($text, 'VALUE "ProductVersion", "[^"]*\\0"', "VALUE `"ProductVersion`", `"$env:VERSION\0`"")
-          $text = [regex]::Replace($text, 'LTEXT\s+"FolderView, Version [^"]+"', "LTEXT `"FolderView, Version $env:VERSION`"")
-
-          [System.IO.File]::WriteAllText($rcPath, $text, $encoding)
-
-      - name: Build
-        run: >
-          msbuild /m
-          /p:Configuration=${{ env.BUILD_CONFIGURATION }}
-          /p:Platform=${{ env.BUILD_PLATFORM }}
-          /p:VcpkgTriplet=x64-windows
-          /p:VcpkgEnableManifest=true
-          ${{ env.SOLUTION_FILE_PATH }}
-
-      - name: Package portable zip
+      - name: Resolve Docker artifacts
         id: package
         shell: pwsh
         run: |
-          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "FolderView\x64\Release"
-          $stageDir = Join-Path $env:RUNNER_TEMP "FolderView-package"
-          $zipPath = Join-Path $env:GITHUB_WORKSPACE $env:ZIP_NAME
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE $env:OUTPUT_DIR
+          $zipPath = Join-Path $artifactDir $env:ZIP_NAME
           $shaPath = "$zipPath.sha256"
 
-          if (Test-Path $stageDir) {
-            Remove-Item -Recurse -Force $stageDir
+          if (-not (Test-Path $zipPath -PathType Leaf)) {
+            throw "Docker build did not export package: $zipPath"
           }
-          New-Item -ItemType Directory -Path $stageDir | Out-Null
-
-          Copy-Item (Join-Path $releaseDir "FolderView.exe") $stageDir
-          Copy-Item (Join-Path $releaseDir "zlib1.dll") $stageDir
-
-          if (Test-Path $zipPath) {
-            Remove-Item -Force $zipPath
+          if (-not (Test-Path $shaPath -PathType Leaf)) {
+            throw "Docker build did not export checksum: $shaPath"
           }
-          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
 
-          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
-          "$hash  $env:ZIP_NAME" | Out-File -FilePath $shaPath -Encoding ascii
+          $hashLine = [System.IO.File]::ReadAllText($shaPath, [System.Text.Encoding]::ASCII).Trim()
+          $hash = ($hashLine -split "\s+")[0]
           "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "SHA_PATH=$shaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "ZIP_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
           "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha_path=$shaPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "zip_sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Validate package contents
-        shell: pwsh
-        run: |
-          $entries = tar -tf $env:ZIP_PATH
-          $required = @("FolderView.exe", "zlib1.dll")
-          $forbidden = @("FolderView.pdb", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
-
-          foreach ($file in $required) {
-            if ($entries -notcontains $file) {
-              throw "Package is missing required file: $file"
-            }
-          }
-
-          foreach ($file in $forbidden) {
-            if ($entries -contains $file) {
-              throw "Package contains forbidden file: $file"
-            }
-          }
 
       - name: Write release notes
         id: notes
