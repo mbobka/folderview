@@ -170,9 +170,12 @@ typedef struct FvWideBuilder {
 static HANDLE g_heap;
 static ID2D1Factory *g_d2d_factory;
 static ID2D1HwndRenderTarget *g_render_target;
+static ID2D1Bitmap *g_d2d_bitmap;
+static SIZE_T g_d2d_bitmap_image = ~(SIZE_T)0;
 static FvStringList g_files;
 static DecodedImage *g_cache;
 static ZipArchive g_zip;
+static const ZipEntry **g_zip_entries;
 static BOOL g_zip_mode;
 static SIZE_T g_current_image;
 static BOOL g_block_navigation;
@@ -180,7 +183,6 @@ static BOOL g_has_image_shift;
 static POINT g_image_shift;
 static POINTS g_drag_origin;
 static FLOAT g_scale = 1.0f;
-static LARGE_INTEGER g_performance_frequency;
 
 static LRESULT CALLBACK FvWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 static void fv_set_current_image(HWND window, BOOL repaint);
@@ -188,6 +190,7 @@ static void fv_previous_image(HWND window);
 static void fv_next_image(HWND window);
 static void fv_draw_image(HWND window);
 static void fv_update_window_title(HWND window);
+static void fv_release_d2d_bitmap(void);
 
 static BOOL fv_size_multiply(SIZE_T left, SIZE_T right, SIZE_T *result) {
     SIZE_T maximum = ~(SIZE_T)0;
@@ -377,12 +380,14 @@ static int fv_compare_name_parts(
         return left_length < right_length ? -1 : left_length != right_length;
     }
 
-    result = CompareStringOrdinal(
+    /* lstrcmpiW использует лингвистическое сравнение текущей локали. */
+    result = CompareStringW(
+        GetThreadLocale(),
+        NORM_IGNORECASE,
         left,
         (int)left_length,
         right,
-        (int)right_length,
-        TRUE);
+        (int)right_length);
     if (result == CSTR_LESS_THAN) {
         return -1;
     }
@@ -423,7 +428,26 @@ static int fv_compare_paths(const WCHAR *left_path, const WCHAR *right_path) {
     return lstrcmpiW(left, right);
 }
 
-static void fv_string_list_sort(FvStringList *list) {
+static void fv_string_list_swap(
+    FvStringList *list,
+    const ZipEntry **zip_entries,
+    SIZE_T left,
+    SIZE_T right) {
+    WCHAR *text = list->items[left];
+
+    list->items[left] = list->items[right];
+    list->items[right] = text;
+    if (zip_entries != NULL) {
+        const ZipEntry *entry = zip_entries[left];
+
+        zip_entries[left] = zip_entries[right];
+        zip_entries[right] = entry;
+    }
+}
+
+static void fv_string_list_sort_with_entries(
+    FvStringList *list,
+    const ZipEntry **zip_entries) {
     SIZE_T start;
     SIZE_T end;
 
@@ -437,7 +461,6 @@ static void fv_string_list_sort(FvStringList *list) {
 
         while (root <= (list->count - 2) / 2) {
             SIZE_T child = root * 2 + 1;
-            WCHAR *value;
 
             if (child + 1 < list->count &&
                 fv_compare_paths(list->items[child], list->items[child + 1]) < 0) {
@@ -446,9 +469,7 @@ static void fv_string_list_sort(FvStringList *list) {
             if (fv_compare_paths(list->items[root], list->items[child]) >= 0) {
                 break;
             }
-            value = list->items[root];
-            list->items[root] = list->items[child];
-            list->items[child] = value;
+            fv_string_list_swap(list, zip_entries, root, child);
             root = child;
         }
     }
@@ -456,10 +477,8 @@ static void fv_string_list_sort(FvStringList *list) {
     for (end = list->count; end > 1; --end) {
         SIZE_T root = 0;
         SIZE_T heap_count = end - 1;
-        WCHAR *value = list->items[0];
 
-        list->items[0] = list->items[heap_count];
-        list->items[heap_count] = value;
+        fv_string_list_swap(list, zip_entries, 0, heap_count);
 
         while (heap_count > 1 && root <= (heap_count - 2) / 2) {
             SIZE_T child = root * 2 + 1;
@@ -471,12 +490,14 @@ static void fv_string_list_sort(FvStringList *list) {
             if (fv_compare_paths(list->items[root], list->items[child]) >= 0) {
                 break;
             }
-            value = list->items[root];
-            list->items[root] = list->items[child];
-            list->items[child] = value;
+            fv_string_list_swap(list, zip_entries, root, child);
             root = child;
         }
     }
+}
+
+static void fv_string_list_sort(FvStringList *list) {
+    fv_string_list_sort_with_entries(list, NULL);
 }
 
 static WCHAR *fv_join_path(const WCHAR *directory, const WCHAR *name) {
@@ -676,26 +697,34 @@ static void fv_free_cache(void) {
 }
 
 static void fv_clear_files_and_cache(void) {
+    fv_release_d2d_bitmap();
     fv_free_cache();
     fv_string_list_clear(&g_files);
+    fv_heap_free(g_zip_entries);
+    g_zip_entries = NULL;
     g_current_image = 0;
     g_has_image_shift = FALSE;
     g_image_shift.x = 0;
     g_image_shift.y = 0;
 }
 
-static BOOL fv_allocate_cache(void) {
+static BOOL fv_allocate_cache_for_count(SIZE_T count, DecodedImage **cache) {
     SIZE_T bytes;
 
-    if (g_files.count == 0) {
+    *cache = NULL;
+    if (count == 0) {
         return TRUE;
     }
-    if (!fv_size_multiply(g_files.count, sizeof(DecodedImage), &bytes)) {
+    if (!fv_size_multiply(count, sizeof(DecodedImage), &bytes)) {
         return FALSE;
     }
 
-    g_cache = (DecodedImage *)fv_heap_allocate(bytes, TRUE);
-    return g_cache != NULL;
+    *cache = (DecodedImage *)fv_heap_allocate(bytes, TRUE);
+    return *cache != NULL;
+}
+
+static BOOL fv_allocate_cache(void) {
+    return fv_allocate_cache_for_count(g_files.count, &g_cache);
 }
 
 static BOOL fv_enumerate_matching_files(
@@ -705,6 +734,7 @@ static BOOL fv_enumerate_matching_files(
     WCHAR *pattern = fv_join_path(directory, L"*");
     WIN32_FIND_DATAW find_data;
     HANDLE find_handle;
+    DWORD find_error;
     BOOL success = TRUE;
 
     if (pattern == NULL) {
@@ -712,9 +742,10 @@ static BOOL fv_enumerate_matching_files(
     }
 
     find_handle = FindFirstFileW(pattern, &find_data);
+    find_error = find_handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     fv_heap_free(pattern);
     if (find_handle == INVALID_HANDLE_VALUE) {
-        return GetLastError() == ERROR_FILE_NOT_FOUND;
+        return find_error == ERROR_FILE_NOT_FOUND;
     }
 
     do {
@@ -814,36 +845,91 @@ static BOOL fv_virtual_path_equal(const WCHAR *left, const WCHAR *right) {
     }
 }
 
-static BOOL fv_build_zip_file_list(const WCHAR *zip_path, const WCHAR *start_entry) {
+static BOOL fv_build_zip_file_list(
+    const WCHAR *zip_path,
+    const WCHAR *start_entry,
+    BOOL require_image) {
+    ZipArchive temporary_zip;
+    FvStringList temporary_files;
+    const ZipEntry **temporary_zip_entries = NULL;
+    DecodedImage *temporary_cache = NULL;
+    SIZE_T temporary_current_image = 0;
+    SIZE_T entry_count;
+    SIZE_T byte_count;
     SIZE_T index;
+    BOOL success = FALSE;
 
-    if (!ZipArchive_Open(&g_zip, zip_path)) {
+    ZipArchive_Init(&temporary_zip);
+    fv_string_list_init(&temporary_files);
+    if (!ZipArchive_Open(&temporary_zip, zip_path)) {
         MessageBoxW(NULL, L"Не удалось открыть ZIP-архив", L"FolderView", MB_OK | MB_ICONERROR);
-        return FALSE;
+        goto cleanup;
     }
-    g_zip_mode = TRUE;
 
-    for (index = 0; index < ZipArchive_EntryCount(&g_zip); ++index) {
-        const ZipEntry *entry = ZipArchive_EntryAt(&g_zip, index);
-        const WCHAR *name = entry != NULL ? ZipEntry_Name(entry) : NULL;
-
-        if (name != NULL && fv_is_supported_image(name)) {
-            if (!fv_string_list_add(&g_files, name)) {
-                return FALSE;
-            }
+    entry_count = ZipArchive_EntryCount(&temporary_zip);
+    if (entry_count != 0) {
+        if (!fv_size_multiply(entry_count, sizeof(*temporary_zip_entries), &byte_count)) {
+            goto cleanup;
+        }
+        temporary_zip_entries =
+            (const ZipEntry **)fv_heap_allocate(byte_count, FALSE);
+        if (temporary_zip_entries == NULL) {
+            goto cleanup;
         }
     }
 
-    fv_string_list_sort(&g_files);
+    for (index = 0; index < entry_count; ++index) {
+        const ZipEntry *entry = ZipArchive_EntryAt(&temporary_zip, index);
+        const WCHAR *name = entry != NULL ? ZipEntry_Name(entry) : NULL;
+
+        if (name != NULL && fv_is_supported_image(name)) {
+            SIZE_T image_index = temporary_files.count;
+
+            if (!fv_string_list_add(&temporary_files, name)) {
+                goto cleanup;
+            }
+            temporary_zip_entries[image_index] = entry;
+        }
+    }
+
+    if (require_image && temporary_files.count == 0) {
+        goto cleanup;
+    }
+
+    fv_string_list_sort_with_entries(&temporary_files, temporary_zip_entries);
     if (start_entry != NULL && *start_entry != L'\0') {
-        for (index = 0; index < g_files.count; ++index) {
-            if (fv_virtual_path_equal(g_files.items[index], start_entry)) {
-                g_current_image = index;
+        for (index = 0; index < temporary_files.count; ++index) {
+            if (fv_virtual_path_equal(temporary_files.items[index], start_entry)) {
+                temporary_current_image = index;
                 break;
             }
         }
     }
-    return fv_allocate_cache();
+    if (!fv_allocate_cache_for_count(temporary_files.count, &temporary_cache)) {
+        goto cleanup;
+    }
+
+    /* Старое состояние уничтожается только после полной подготовки нового. */
+    fv_clear_files_and_cache();
+    ZipArchive_Close(&g_zip);
+    g_zip = temporary_zip;
+    ZipArchive_Init(&temporary_zip);
+    g_files = temporary_files;
+    fv_string_list_init(&temporary_files);
+    g_zip_entries = temporary_zip_entries;
+    temporary_zip_entries = NULL;
+    g_cache = temporary_cache;
+    temporary_cache = NULL;
+    g_current_image = temporary_current_image;
+    g_zip_mode = TRUE;
+    success = TRUE;
+
+cleanup:
+    fv_heap_free(temporary_cache);
+    fv_heap_free(temporary_zip_entries);
+    fv_string_list_clear(&temporary_files);
+    ZipArchive_Close(&temporary_zip);
+    return success;
 }
 
 static BOOL fv_split_zip_virtual_path(
@@ -898,39 +984,6 @@ static BOOL fv_split_zip_virtual_path(
 
     fv_heap_free(candidate);
     return FALSE;
-}
-
-static ULONGLONG fv_elapsed_microseconds(
-    const LARGE_INTEGER *start,
-    const LARGE_INTEGER *finish) {
-    LONGLONG elapsed = finish->QuadPart - start->QuadPart;
-
-    if (elapsed <= 0 || g_performance_frequency.QuadPart <= 0) {
-        return 0;
-    }
-    return (ULONGLONG)(elapsed * 1000000 / g_performance_frequency.QuadPart);
-}
-
-static void fv_debug_timing(
-    const WCHAR *operation,
-    const WCHAR *path,
-    const LARGE_INTEGER *start,
-    const LARGE_INTEGER *finish) {
-    FvWideBuilder builder;
-
-    builder.data = NULL;
-    builder.length = 0;
-    builder.capacity = 0;
-    if (fv_builder_append(&builder, L"[") &&
-        fv_builder_append(&builder, operation) &&
-        fv_builder_append(&builder, L"] ") &&
-        (path == NULL || (fv_builder_append(&builder, fv_file_name(path)) &&
-                          fv_builder_append(&builder, L": "))) &&
-        fv_builder_append_u64(&builder, fv_elapsed_microseconds(start, finish)) &&
-        fv_builder_append(&builder, L" us\n")) {
-        OutputDebugStringW(builder.data);
-    }
-    fv_builder_dispose(&builder);
 }
 
 static FLOAT fv_calculate_scale(HWND window, UINT width, UINT height) {
@@ -1027,9 +1080,11 @@ static HRESULT fv_decode_current_image(void) {
         BYTE *data = NULL;
         SIZE_T size = 0;
 
-        if (!ZipArchive_ExtractByName(
+        if (g_zip_entries == NULL ||
+            g_current_image >= g_files.count ||
+            !ZipArchive_ExtractEntry(
                 &g_zip,
-                g_files.items[g_current_image],
+                g_zip_entries[g_current_image],
                 FV_MAX_ZIP_IMAGE_BYTES,
                 &data,
                 &size)) {
@@ -1047,8 +1102,6 @@ static HRESULT fv_decode_current_image(void) {
 
 static void fv_set_current_image(HWND window, BOOL repaint) {
     DecodedImage *image;
-    LARGE_INTEGER start;
-    LARGE_INTEGER finish;
     WINDOWPLACEMENT placement;
 
     if (g_cache == NULL || g_current_image >= g_files.count) {
@@ -1058,9 +1111,9 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     g_has_image_shift = FALSE;
     g_image_shift.x = 0;
     g_image_shift.y = 0;
+    fv_release_d2d_bitmap();
     image = &g_cache[g_current_image];
     if (!DecodedImage_IsValid(image)) {
-        QueryPerformanceCounter(&start);
         if (FAILED(fv_decode_current_image()) || !DecodedImage_IsValid(image)) {
             MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
             if (repaint) {
@@ -1068,11 +1121,7 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
             }
             return;
         }
-        QueryPerformanceCounter(&finish);
-        fv_debug_timing(L"DECODE", g_files.items[g_current_image], &start, &finish);
         fv_trim_cache();
-    } else {
-        OutputDebugStringW(L"[DECODE] CACHED (skipped)\n");
     }
 
     g_scale = fv_calculate_scale(window, image->width, image->height);
@@ -1102,7 +1151,16 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     }
 }
 
+static void fv_release_d2d_bitmap(void) {
+    if (g_d2d_bitmap != NULL) {
+        FV_UNKNOWN_VT(g_d2d_bitmap)->Release(g_d2d_bitmap);
+        g_d2d_bitmap = NULL;
+    }
+    g_d2d_bitmap_image = ~(SIZE_T)0;
+}
+
 static void fv_release_render_target(void) {
+    fv_release_d2d_bitmap();
     if (g_render_target != NULL) {
         FV_TARGET_VT(g_render_target)->Release(g_render_target);
         g_render_target = NULL;
@@ -1184,14 +1242,11 @@ static ID2D1Bitmap *fv_create_d2d_bitmap(const DecodedImage *image) {
 }
 
 static void fv_draw_image(HWND window) {
-    LARGE_INTEGER start;
-    LARGE_INTEGER finish;
     const DecodedImage *image = NULL;
     ID2D1Bitmap *bitmap = NULL;
     D2D1_COLOR_F background;
     HRESULT result;
 
-    QueryPerformanceCounter(&start);
     if (FAILED(fv_create_render_target(window))) {
         return;
     }
@@ -1203,7 +1258,14 @@ static void fv_draw_image(HWND window) {
     if (g_cache != NULL && g_current_image < g_files.count &&
         DecodedImage_IsValid(&g_cache[g_current_image])) {
         image = &g_cache[g_current_image];
-        bitmap = fv_create_d2d_bitmap(image);
+        if (g_d2d_bitmap == NULL || g_d2d_bitmap_image != g_current_image) {
+            fv_release_d2d_bitmap();
+            g_d2d_bitmap = fv_create_d2d_bitmap(image);
+            if (g_d2d_bitmap != NULL) {
+                g_d2d_bitmap_image = g_current_image;
+            }
+        }
+        bitmap = g_d2d_bitmap;
     }
 
     background.r = 0.66f;
@@ -1252,15 +1314,9 @@ static void fv_draw_image(HWND window) {
     }
 
     result = FV_TARGET_VT(g_render_target)->EndDraw(g_render_target, NULL, NULL);
-    if (bitmap != NULL) {
-        FV_UNKNOWN_VT(bitmap)->Release(bitmap);
-    }
     if (result == D2DERR_RECREATE_TARGET) {
         fv_release_render_target();
     }
-
-    QueryPerformanceCounter(&finish);
-    fv_debug_timing(L"DRAW", NULL, &start, &finish);
 }
 
 static void fv_previous_image(HWND window) {
@@ -1437,13 +1493,8 @@ static void fv_switch_zip_file(HWND window, int direction) {
         return;
     }
 
-    fv_clear_files_and_cache();
-    ZipArchive_Close(&g_zip);
-    g_zip_mode = FALSE;
-    if (fv_build_zip_file_list(next_archive, NULL) && g_files.count != 0) {
+    if (fv_build_zip_file_list(next_archive, NULL, TRUE)) {
         fv_set_current_image(window, TRUE);
-    } else {
-        InvalidateRect(window, NULL, TRUE);
     }
     fv_heap_free(next_archive);
 }
@@ -1727,7 +1778,6 @@ static int fv_application_main(void) {
         return -1;
     }
     fv_string_list_init(&g_files);
-    QueryPerformanceFrequency(&g_performance_frequency);
     ZipArchive_Init(&g_zip);
     zip_initialized = TRUE;
 
@@ -1764,7 +1814,7 @@ static int fv_application_main(void) {
         goto cleanup;
     }
     if (fv_split_zip_virtual_path(root, &zip_path, &inner_entry)) {
-        loaded = fv_build_zip_file_list(zip_path, inner_entry);
+        loaded = fv_build_zip_file_list(zip_path, inner_entry, FALSE);
     } else {
         loaded = fv_build_disk_file_list(root);
     }

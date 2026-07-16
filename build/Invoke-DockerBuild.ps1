@@ -3,9 +3,6 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
 
-    [ValidateSet('x64')]
-    [string] $Platform = 'x64',
-
     [string] $Version = '',
 
     [string] $ZipName = '',
@@ -29,14 +26,6 @@ else {
 $repoRootWithSeparator = $repoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 if (-not $outputPath.StartsWith($repoRootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "OutputDir must be inside repository: $outputPath"
-}
-
-$dockerOs = (& docker info --format '{{.OSType}}' 2>$null)
-if ($LASTEXITCODE -ne 0) {
-    throw 'Docker Engine is not available. Start Docker Desktop (Linux containers mode).'
-}
-if ($dockerOs -ne 'linux') {
-    throw "Docker Engine is running '$dockerOs' containers. Switch Docker Desktop to Linux containers before building FolderView."
 }
 
 if (Test-Path -LiteralPath $outputPath) {

@@ -19,10 +19,8 @@ typedef struct ZipEntry {
     ULONGLONG compressed_size;
     ULONGLONG uncompressed_size;
     ULONGLONG local_header_offset;
-    DWORD crc32;
     WORD compression_method;
     WORD flags;
-    BOOL is_directory;
 } ZipEntry;
 
 typedef struct ZipArchive {
@@ -47,20 +45,7 @@ LPCWSTR ZipArchive_Path(const ZipArchive* archive);
 /* Записи принадлежат архиву и становятся недействительными после Close/Open. */
 SIZE_T ZipArchive_EntryCount(const ZipArchive* archive);
 const ZipEntry* ZipArchive_EntryAt(const ZipArchive* archive, SIZE_T index);
-const ZipEntry* ZipArchive_FindEntry(const ZipArchive* archive, LPCWSTR name);
 LPCWSTR ZipEntry_Name(const ZipEntry* entry);
-
-/*
- * Возвращает отсортированный массив указателей на изображения. Сам массив надо
- * освободить через ZipArchive_FreeEntryList, записи остаются собственностью архива.
- */
-BOOL ZipArchive_GetImageEntries(
-    const ZipArchive* archive,
-    const WCHAR* const* extensions,
-    SIZE_T extension_count,
-    const ZipEntry*** out_entries,
-    SIZE_T* out_count);
-void ZipArchive_FreeEntryList(const ZipEntry** entries);
 
 /*
  * Извлекает entry в process heap. При max_output_bytes == 0 применяется
@@ -70,12 +55,6 @@ void ZipArchive_FreeEntryList(const ZipEntry** entries);
 BOOL ZipArchive_ExtractEntry(
     ZipArchive* archive,
     const ZipEntry* entry,
-    ULONGLONG max_output_bytes,
-    BYTE** data,
-    SIZE_T* size);
-BOOL ZipArchive_ExtractByName(
-    ZipArchive* archive,
-    LPCWSTR name,
     ULONGLONG max_output_bytes,
     BYTE** data,
     SIZE_T* size);

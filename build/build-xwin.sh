@@ -21,19 +21,12 @@ TARGET="x86_64-pc-windows-msvc"
 rm -rf "$BUILD_DIR" "$OUT_DIR"
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
 
-# --- Нормализация FolderView.rc в UTF-8 + прошивка версии -------------------
-# Исходный .rc может быть в UTF-16 или UTF-8.
-# Приводим к UTF-8 рабочей копии: на ней штампуем версию и компилируем ресурс.
+# --- Рабочая копия FolderView.rc + прошивка версии --------------------------
+# Исходный ресурс хранится в UTF-8. Версию штампуем в рабочей копии, чтобы не
+# изменять файл в дереве исходников.
 RC_SRC="$PROJECT_DIR/FolderView.rc"
 RC_WORK="$BUILD_DIR/FolderView.rc"
-sig="$(head -c4 "$RC_SRC" | od -An -tx1 | tr -d ' \n')"
-case "$sig" in
-    fffe*|feff*) iconv -f UTF-16   -t UTF-8 "$RC_SRC" > "$RC_WORK" ;;     # UTF-16 LE/BE с BOM
-    efbbbf*)     tail -c +4 "$RC_SRC" > "$RC_WORK" ;;                     # UTF-8 с BOM
-    00*)         iconv -f UTF-16BE -t UTF-8 "$RC_SRC" > "$RC_WORK" ;;     # UTF-16BE без BOM
-    ??00*)       iconv -f UTF-16LE -t UTF-8 "$RC_SRC" > "$RC_WORK" ;;     # UTF-16LE без BOM
-    *)           cp "$RC_SRC" "$RC_WORK" ;;                               # UTF-8 без BOM
-esac
+cp "$RC_SRC" "$RC_WORK"
 
 if [ -n "${VERSION// /}" ]; then
     echo "[build] Stamping version $VERSION into FolderView.rc"
@@ -55,7 +48,6 @@ text = re.sub(r"FILEVERSION\s+\d+,\d+,\d+,\d+", f"FILEVERSION {file_version}", t
 text = re.sub(r"PRODUCTVERSION\s+\d+,\d+,\d+,\d+", f"PRODUCTVERSION {file_version}", text)
 text = re.sub(r'VALUE "FileVersion", "[^"]*\\0"', f'VALUE "FileVersion", "{version}\\\\0"', text)
 text = re.sub(r'VALUE "ProductVersion", "[^"]*\\0"', f'VALUE "ProductVersion", "{version}\\\\0"', text)
-text = re.sub(r'LTEXT\s+"FolderView, Version [^"]+"', f'LTEXT "FolderView, Version {version}"', text)
 
 with open(path, "w", encoding="utf-8") as f:
     f.write(text)

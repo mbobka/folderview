@@ -16,7 +16,6 @@ permissions:
 
 env:
   BUILD_CONFIGURATION: Release
-  BUILD_PLATFORM: x64
   PACKAGE_ID: mbobka.FolderView
   COMMAND_ALIAS: fview
   OUTPUT_DIR: out-win-amd64
@@ -55,7 +54,6 @@ jobs:
         run: |
           .\build\Invoke-DockerBuild.ps1 `
             -Configuration $env:BUILD_CONFIGURATION `
-            -Platform $env:BUILD_PLATFORM `
             -Version $env:VERSION `
             -ZipName $env:ZIP_NAME `
             -OutputDir $env:OUTPUT_DIR

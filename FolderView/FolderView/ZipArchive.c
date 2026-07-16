@@ -6,6 +6,7 @@
 
 #define ZIP_LOCAL_FILE_HEADER_SIGNATURE 0x04034B50UL
 #define ZIP_CENTRAL_DIRECTORY_SIGNATURE 0x02014B50UL
+#define ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE 0x05054B50UL
 #define ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE 0x06054B50UL
 #define ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE 0x06064B50UL
 #define ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE 0x07064B50UL
@@ -179,8 +180,9 @@ static BOOL zip_find_unicode_path(
             zip_read_u32(extra + field_offset + 1) == original_crc) {
             SIZE_T name_size = (SIZE_T)field_size - 5;
 
-            if (name_size == 0 || name_size > 0xFFFFU) {
-                return FALSE;
+            if (name_size == 0) {
+                position = field_offset + field_size;
+                continue;
             }
             *utf8_name = extra + field_offset + 5;
             *utf8_name_size = (WORD)name_size;
@@ -190,7 +192,8 @@ static BOOL zip_find_unicode_path(
         position = field_offset + field_size;
     }
 
-    return position == extra_size;
+    /* Некоторые архиваторы оставляют в конце extra-поля до трёх байт padding. */
+    return (SIZE_T)extra_size - position < 4;
 }
 
 static WCHAR* zip_decode_name(
@@ -209,6 +212,7 @@ static WCHAR* zip_decode_name(
     int wide_count;
     WCHAR* result;
     SIZE_T index;
+    BOOL can_fallback_to_legacy = FALSE;
 
     *is_directory = FALSE;
     if (name_size == 0) {
@@ -219,6 +223,7 @@ static WCHAR* zip_decode_name(
     if ((flags & ZIP_FLAG_UTF8) != 0) {
         code_page = CP_UTF8;
         conversion_flags = MB_ERR_INVALID_CHARS;
+        can_fallback_to_legacy = TRUE;
     }
     else if (extra_size != 0) {
         if (!zip_find_unicode_path(
@@ -236,9 +241,11 @@ static WCHAR* zip_decode_name(
             byte_count = unicode_name_size;
             code_page = CP_UTF8;
             conversion_flags = MB_ERR_INVALID_CHARS;
+            can_fallback_to_legacy = TRUE;
         }
     }
 
+retry_conversion:
     wide_count = MultiByteToWideChar(
         code_page,
         conversion_flags,
@@ -246,6 +253,15 @@ static WCHAR* zip_decode_name(
         (int)byte_count,
         NULL,
         0);
+    if (wide_count <= 0 && can_fallback_to_legacy) {
+        /* Битый UTF-8 не должен делать весь архив нечитаемым. */
+        bytes = name;
+        byte_count = name_size;
+        code_page = 437;
+        conversion_flags = 0;
+        can_fallback_to_legacy = FALSE;
+        goto retry_conversion;
+    }
     if (wide_count <= 0 ||
         (SIZE_T)wide_count > ((SIZE_T)-1) / sizeof(WCHAR) - 1) {
         if (GetLastError() == ERROR_SUCCESS) {
@@ -411,6 +427,339 @@ static BOOL zip_append_entry(ZipArchive* archive, const ZipEntry* entry) {
     return TRUE;
 }
 
+static BOOL zip_read_central_directory_entry(
+    ZipArchive* archive,
+    ULONGLONG cursor,
+    ULONGLONG directory_end,
+    ZipEntry* entry,
+    BOOL* is_directory,
+    ULONGLONG* record_end) {
+    BYTE header[ZIP_CENTRAL_DIRECTORY_HEADER_SIZE];
+    WORD name_size;
+    WORD extra_size;
+    WORD comment_size;
+    WORD disk_start16;
+    DWORD compressed_size32;
+    DWORD uncompressed_size32;
+    DWORD local_offset32;
+    ULONGLONG record_size = ZIP_CENTRAL_DIRECTORY_HEADER_SIZE;
+    BYTE* name = NULL;
+    BYTE* extra = NULL;
+    WCHAR* wide_name;
+    ULONGLONG compressed_size;
+    ULONGLONG uncompressed_size;
+    ULONGLONG local_offset;
+    DWORD disk_start;
+    DWORD error;
+
+    ZeroMemory(entry, sizeof(*entry));
+    *is_directory = FALSE;
+    if (cursor > directory_end ||
+        directory_end - cursor < ZIP_CENTRAL_DIRECTORY_HEADER_SIZE) {
+        return zip_bad_format();
+    }
+    if (!zip_read_exact_at(archive, cursor, header, sizeof(header))) {
+        return FALSE;
+    }
+    if (zip_read_u32(header) != ZIP_CENTRAL_DIRECTORY_SIGNATURE) {
+        return zip_bad_format();
+    }
+
+    compressed_size32 = zip_read_u32(header + 20);
+    uncompressed_size32 = zip_read_u32(header + 24);
+    name_size = zip_read_u16(header + 28);
+    extra_size = zip_read_u16(header + 30);
+    comment_size = zip_read_u16(header + 32);
+    disk_start16 = zip_read_u16(header + 34);
+    local_offset32 = zip_read_u32(header + 42);
+
+    if (!zip_add_u64(record_size, name_size, &record_size) ||
+        !zip_add_u64(record_size, extra_size, &record_size) ||
+        !zip_add_u64(record_size, comment_size, &record_size) ||
+        !zip_add_u64(cursor, record_size, record_end) ||
+        *record_end > directory_end ||
+        name_size == 0) {
+        return zip_bad_format();
+    }
+
+    name = (BYTE*)zip_heap_alloc(name_size);
+    if (name == NULL) {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+    if (!zip_read_exact_at(
+            archive,
+            cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE,
+            name,
+            name_size)) {
+        goto cleanup;
+    }
+
+    if (extra_size != 0) {
+        extra = (BYTE*)zip_heap_alloc(extra_size);
+        if (extra == NULL) {
+            SetLastError(ERROR_OUTOFMEMORY);
+            goto cleanup;
+        }
+        if (!zip_read_exact_at(
+                archive,
+                cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE + name_size,
+                extra,
+                extra_size)) {
+            goto cleanup;
+        }
+    }
+
+    if (!zip_parse_zip64_extra(
+            extra,
+            extra_size,
+            compressed_size32,
+            uncompressed_size32,
+            local_offset32,
+            disk_start16,
+            &compressed_size,
+            &uncompressed_size,
+            &local_offset,
+            &disk_start)) {
+        goto cleanup;
+    }
+    if (disk_start != 0) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        goto cleanup;
+    }
+
+    wide_name = zip_decode_name(
+        name,
+        name_size,
+        zip_read_u16(header + 8),
+        extra,
+        extra_size,
+        is_directory);
+    if (wide_name == NULL) {
+        goto cleanup;
+    }
+
+    entry->name = wide_name;
+    entry->compressed_size = compressed_size;
+    entry->uncompressed_size = uncompressed_size;
+    entry->local_header_offset = local_offset;
+    entry->compression_method = zip_read_u16(header + 10);
+    entry->flags = zip_read_u16(header + 8);
+    zip_heap_free(extra);
+    zip_heap_free(name);
+    return TRUE;
+
+cleanup:
+    error = GetLastError();
+    zip_heap_free(extra);
+    zip_heap_free(name);
+    SetLastError(error == ERROR_SUCCESS ? ERROR_BAD_FORMAT : error);
+    return FALSE;
+}
+
+static BOOL zip_validate_central_directory_layout(
+    ZipArchive* archive,
+    ULONGLONG directory_offset,
+    ULONGLONG directory_size,
+    ULONGLONG total_entries) {
+    ULONGLONG directory_end;
+    ULONGLONG cursor;
+    ULONGLONG index;
+
+    if (!zip_add_u64(directory_offset, directory_size, &directory_end) ||
+        directory_end > archive->file_size) {
+        return FALSE;
+    }
+
+    cursor = directory_offset;
+    for (index = 0; index < total_entries; ++index) {
+        ZipEntry entry;
+        BOOL is_directory;
+        ULONGLONG record_end;
+
+        if (!zip_read_central_directory_entry(
+                archive,
+                cursor,
+                directory_end,
+                &entry,
+                &is_directory,
+                &record_end)) {
+            return FALSE;
+        }
+        zip_heap_free(entry.name);
+        cursor = record_end;
+    }
+
+    if (cursor == directory_end || directory_end - cursor < 4) {
+        return TRUE;
+    }
+
+    /* После записей допустима стандартная цифровая подпись каталога. */
+    if (directory_end - cursor >= 6) {
+        BYTE signature_header[6];
+        ULONGLONG signature_end;
+
+        if (zip_read_exact_at(
+                archive,
+                cursor,
+                signature_header,
+                sizeof(signature_header)) &&
+            zip_read_u32(signature_header) ==
+                ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE &&
+            zip_add_u64(cursor, sizeof(signature_header), &signature_end) &&
+            zip_add_u64(
+                signature_end,
+                zip_read_u16(signature_header + 4),
+                &signature_end) &&
+            signature_end <= directory_end &&
+            directory_end - signature_end < 4) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static int zip_eocd_candidate_score(
+    ZipArchive* archive,
+    const BYTE* tail,
+    SIZE_T tail_size,
+    ULONGLONG tail_offset,
+    SIZE_T position,
+    int best_score) {
+    SIZE_T trailing_size;
+    WORD comment_size;
+    WORD entries_on_disk;
+    WORD total_entries;
+    DWORD directory_size;
+    DWORD directory_offset;
+    ULONGLONG eocd_offset = tail_offset + position;
+    ULONGLONG directory_end;
+    ULONGLONG candidate_directory_size;
+    ULONGLONG candidate_directory_offset;
+    ULONGLONG candidate_total_entries;
+    BOOL needs_zip64;
+    int score = 0;
+
+    if (zip_read_u32(tail + position) !=
+            ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
+        return -1;
+    }
+
+    trailing_size = tail_size - position - ZIP_END_OF_CENTRAL_DIRECTORY_SIZE;
+    comment_size = zip_read_u16(tail + position + 20);
+    if ((SIZE_T)comment_size > trailing_size ||
+        zip_read_u16(tail + position + 4) != 0 ||
+        zip_read_u16(tail + position + 6) != 0) {
+        return -1;
+    }
+
+    entries_on_disk = zip_read_u16(tail + position + 8);
+    total_entries = zip_read_u16(tail + position + 10);
+    directory_size = zip_read_u32(tail + position + 12);
+    directory_offset = zip_read_u32(tail + position + 16);
+    needs_zip64 = entries_on_disk == 0xFFFFU ||
+        total_entries == 0xFFFFU ||
+        directory_size == 0xFFFFFFFFUL ||
+        directory_offset == 0xFFFFFFFFUL;
+
+    if (needs_zip64) {
+        BYTE locator[ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIZE];
+        BYTE eocd64[ZIP64_END_OF_CENTRAL_DIRECTORY_SIZE];
+        ULONGLONG eocd64_offset;
+        ULONGLONG eocd64_record_size;
+        ULONGLONG eocd64_end;
+        ULONGLONG directory_size64;
+        ULONGLONG directory_offset64;
+        ULONGLONG total_entries64;
+
+        if (eocd_offset < sizeof(locator) ||
+            !zip_read_exact_at(
+                archive,
+                eocd_offset - sizeof(locator),
+                locator,
+                sizeof(locator)) ||
+            zip_read_u32(locator) !=
+                ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE ||
+            zip_read_u32(locator + 4) != 0 ||
+            zip_read_u32(locator + 16) != 1) {
+            return -1;
+        }
+
+        eocd64_offset = zip_read_u64(locator + 8);
+        if (!zip_read_exact_at(
+                archive,
+                eocd64_offset,
+                eocd64,
+                sizeof(eocd64)) ||
+            zip_read_u32(eocd64) !=
+                ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE ||
+            zip_read_u64(eocd64 + 4) < 44) {
+            return -1;
+        }
+
+        eocd64_record_size = zip_read_u64(eocd64 + 4);
+        if (!zip_add_u64(eocd64_offset, 12, &eocd64_end) ||
+            !zip_add_u64(eocd64_end, eocd64_record_size, &eocd64_end) ||
+            eocd64_end > eocd_offset - sizeof(locator) ||
+            zip_read_u32(eocd64 + 16) != 0 ||
+            zip_read_u32(eocd64 + 20) != 0 ||
+            zip_read_u64(eocd64 + 24) != zip_read_u64(eocd64 + 32)) {
+            return -1;
+        }
+
+        total_entries64 = zip_read_u64(eocd64 + 32);
+        directory_size64 = zip_read_u64(eocd64 + 40);
+        directory_offset64 = zip_read_u64(eocd64 + 48);
+        if (!zip_add_u64(
+                directory_offset64,
+                directory_size64,
+                &directory_end) ||
+            directory_end > eocd64_offset ||
+            total_entries64 >
+                directory_size64 / ZIP_CENTRAL_DIRECTORY_HEADER_SIZE) {
+            return -1;
+        }
+        if (directory_end == eocd64_offset) {
+            score += 2;
+        }
+        candidate_total_entries = total_entries64;
+        candidate_directory_size = directory_size64;
+        candidate_directory_offset = directory_offset64;
+    }
+    else {
+        if (entries_on_disk != total_entries ||
+            !zip_add_u64(directory_offset, directory_size, &directory_end) ||
+            directory_end > eocd_offset ||
+            (ULONGLONG)total_entries >
+                (ULONGLONG)directory_size / ZIP_CENTRAL_DIRECTORY_HEADER_SIZE) {
+            return -1;
+        }
+        if (directory_end == eocd_offset) {
+            score += 2;
+        }
+        candidate_total_entries = total_entries;
+        candidate_directory_size = directory_size;
+        candidate_directory_offset = directory_offset;
+    }
+
+    if ((SIZE_T)comment_size == trailing_size) {
+        ++score;
+    }
+    if (score <= best_score) {
+        return score;
+    }
+
+    if (!zip_validate_central_directory_layout(
+            archive,
+            candidate_directory_offset,
+            candidate_directory_size,
+            candidate_total_entries)) {
+        return -1;
+    }
+
+    return score;
+}
+
 static BOOL zip_locate_central_directory(
     ZipArchive* archive,
     ULONGLONG* total_entries,
@@ -421,6 +770,7 @@ static BOOL zip_locate_central_directory(
     BYTE* tail;
     SIZE_T position;
     SIZE_T eocd_position = (SIZE_T)-1;
+    int best_eocd_score = -1;
     ULONGLONG eocd_offset;
     WORD disk_number;
     WORD central_disk;
@@ -455,12 +805,17 @@ static BOOL zip_locate_central_directory(
 
     position = tail_size - ZIP_END_OF_CENTRAL_DIRECTORY_SIZE;
     for (;;) {
-        if (zip_read_u32(tail + position) ==
-                ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE &&
-            (SIZE_T)zip_read_u16(tail + position + 20) ==
-                tail_size - position - ZIP_END_OF_CENTRAL_DIRECTORY_SIZE) {
+        int candidate_score = zip_eocd_candidate_score(
+            archive,
+            tail,
+            tail_size,
+            tail_offset,
+            position,
+            best_eocd_score);
+
+        if (candidate_score > best_eocd_score) {
+            best_eocd_score = candidate_score;
             eocd_position = position;
-            break;
         }
         if (position == 0) {
             break;
@@ -502,7 +857,7 @@ static BOOL zip_locate_central_directory(
         has_zip64_locator = TRUE;
     }
 
-    if (has_zip64_locator) {
+    if (has_zip64_locator && needs_zip64) {
         BYTE eocd64[ZIP64_END_OF_CENTRAL_DIRECTORY_SIZE];
         ULONGLONG eocd64_offset = zip_read_u64(locator + 8);
         ULONGLONG eocd64_record_size;
@@ -594,142 +949,34 @@ static BOOL zip_read_central_directory(ZipArchive* archive) {
 
     archive->central_directory_offset = directory_offset;
     archive->central_directory_size = directory_size;
-    directory_end = directory_offset + directory_size;
+    if (!zip_add_u64(directory_offset, directory_size, &directory_end)) {
+        return zip_bad_format();
+    }
     cursor = directory_offset;
 
     for (index = 0; index < total_entries; ++index) {
-        BYTE header[ZIP_CENTRAL_DIRECTORY_HEADER_SIZE];
-        WORD flags;
-        WORD method;
-        WORD name_size;
-        WORD extra_size;
-        WORD comment_size;
-        WORD disk_start16;
-        DWORD compressed_size32;
-        DWORD uncompressed_size32;
-        DWORD local_offset32;
-        ULONGLONG record_size;
-        ULONGLONG record_end;
-        BYTE* name = NULL;
-        BYTE* extra = NULL;
-        WCHAR* wide_name = NULL;
-        BOOL is_directory = FALSE;
-        ULONGLONG compressed_size;
-        ULONGLONG uncompressed_size;
-        ULONGLONG local_offset;
-        DWORD disk_start;
         ZipEntry entry;
+        BOOL is_directory;
+        ULONGLONG record_end;
 
-        if (directory_end - cursor < ZIP_CENTRAL_DIRECTORY_HEADER_SIZE ||
-            !zip_read_exact_at(archive, cursor, header, sizeof(header)) ||
-            zip_read_u32(header) != ZIP_CENTRAL_DIRECTORY_SIGNATURE) {
-            return zip_bad_format();
-        }
-
-        flags = zip_read_u16(header + 8);
-        method = zip_read_u16(header + 10);
-        compressed_size32 = zip_read_u32(header + 20);
-        uncompressed_size32 = zip_read_u32(header + 24);
-        name_size = zip_read_u16(header + 28);
-        extra_size = zip_read_u16(header + 30);
-        comment_size = zip_read_u16(header + 32);
-        disk_start16 = zip_read_u16(header + 34);
-        local_offset32 = zip_read_u32(header + 42);
-
-        record_size = ZIP_CENTRAL_DIRECTORY_HEADER_SIZE;
-        if (!zip_add_u64(record_size, name_size, &record_size) ||
-            !zip_add_u64(record_size, extra_size, &record_size) ||
-            !zip_add_u64(record_size, comment_size, &record_size) ||
-            !zip_add_u64(cursor, record_size, &record_end) ||
-            record_end > directory_end ||
-            name_size == 0) {
-            return zip_bad_format();
-        }
-
-        name = (BYTE*)zip_heap_alloc(name_size);
-        if (name == NULL) {
-            SetLastError(ERROR_OUTOFMEMORY);
-            return FALSE;
-        }
-        if (!zip_read_exact_at(
+        if (!zip_read_central_directory_entry(
                 archive,
-                cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE,
-                name,
-                name_size)) {
-            zip_heap_free(name);
-            return FALSE;
-        }
-
-        if (extra_size != 0) {
-            extra = (BYTE*)zip_heap_alloc(extra_size);
-            if (extra == NULL) {
-                zip_heap_free(name);
-                SetLastError(ERROR_OUTOFMEMORY);
-                return FALSE;
-            }
-            if (!zip_read_exact_at(
-                    archive,
-                    cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE + name_size,
-                    extra,
-                    extra_size)) {
-                zip_heap_free(extra);
-                zip_heap_free(name);
-                return FALSE;
-            }
-        }
-
-        if (!zip_parse_zip64_extra(
-                extra,
-                extra_size,
-                compressed_size32,
-                uncompressed_size32,
-                local_offset32,
-                disk_start16,
-                &compressed_size,
-                &uncompressed_size,
-                &local_offset,
-                &disk_start)) {
-            zip_heap_free(extra);
-            zip_heap_free(name);
-            return FALSE;
-        }
-        if (disk_start != 0) {
-            zip_heap_free(extra);
-            zip_heap_free(name);
-            SetLastError(ERROR_NOT_SUPPORTED);
-            return FALSE;
-        }
-
-        wide_name = zip_decode_name(
-            name,
-            name_size,
-            flags,
-            extra,
-            extra_size,
-            &is_directory);
-        zip_heap_free(extra);
-        zip_heap_free(name);
-        if (wide_name == NULL) {
+                cursor,
+                directory_end,
+                &entry,
+                &is_directory,
+                &record_end)) {
             return FALSE;
         }
 
         if (!is_directory) {
-            entry.name = wide_name;
-            entry.compressed_size = compressed_size;
-            entry.uncompressed_size = uncompressed_size;
-            entry.local_header_offset = local_offset;
-            entry.crc32 = zip_read_u32(header + 16);
-            entry.compression_method = method;
-            entry.flags = flags;
-            entry.is_directory = FALSE;
-
             if (!zip_append_entry(archive, &entry)) {
-                zip_heap_free(wide_name);
+                zip_heap_free(entry.name);
                 return FALSE;
             }
         }
         else {
-            zip_heap_free(wide_name);
+            zip_heap_free(entry.name);
         }
 
         cursor = record_end;
@@ -840,189 +1087,8 @@ const ZipEntry* ZipArchive_EntryAt(const ZipArchive* archive, SIZE_T index) {
     return archive->entries + index;
 }
 
-const ZipEntry* ZipArchive_FindEntry(const ZipArchive* archive, LPCWSTR name) {
-    SIZE_T index;
-
-    if (!ZipArchive_IsOpen(archive) || name == NULL) {
-        return NULL;
-    }
-    for (index = 0; index < archive->entry_count; ++index) {
-        if (lstrcmpW(archive->entries[index].name, name) == 0) {
-            return archive->entries + index;
-        }
-    }
-    return NULL;
-}
-
 LPCWSTR ZipEntry_Name(const ZipEntry* entry) {
     return entry != NULL ? entry->name : NULL;
-}
-
-static BOOL zip_name_has_extension(
-    LPCWSTR name,
-    const WCHAR* const* extensions,
-    SIZE_T extension_count) {
-    LPCWSTR cursor = name;
-    LPCWSTR extension = NULL;
-    SIZE_T index;
-
-    while (*cursor != L'\0') {
-        if (*cursor == L'.') {
-            extension = cursor;
-        }
-        else if (*cursor == L'\\') {
-            extension = NULL;
-        }
-        ++cursor;
-    }
-    if (extension == NULL) {
-        return FALSE;
-    }
-
-    for (index = 0; index < extension_count; ++index) {
-        if (extensions[index] != NULL &&
-            lstrcmpiW(extension, extensions[index]) == 0) {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-static int zip_compare_entries(const ZipEntry* left, const ZipEntry* right) {
-    int result = CompareStringOrdinal(
-        left->name,
-        -1,
-        right->name,
-        -1,
-        TRUE);
-
-    if (result == CSTR_LESS_THAN) {
-        return -1;
-    }
-    if (result == CSTR_GREATER_THAN) {
-        return 1;
-    }
-    return lstrcmpW(left->name, right->name);
-}
-
-static void zip_sort_entry_list(const ZipEntry** entries, SIZE_T count) {
-    SIZE_T start;
-    SIZE_T end;
-
-    if (count < 2) {
-        return;
-    }
-
-    /* Heap sort не требует ни CRT, ни дополнительной памяти. */
-    for (start = count / 2; start != 0; --start) {
-        SIZE_T root = start - 1;
-
-        while (root <= (count - 2) / 2) {
-            SIZE_T child = root * 2 + 1;
-            const ZipEntry* value;
-
-            if (child + 1 < count &&
-                zip_compare_entries(entries[child], entries[child + 1]) < 0) {
-                ++child;
-            }
-            if (zip_compare_entries(entries[root], entries[child]) >= 0) {
-                break;
-            }
-            value = entries[root];
-            entries[root] = entries[child];
-            entries[child] = value;
-            root = child;
-        }
-    }
-
-    for (end = count; end > 1; --end) {
-        SIZE_T root = 0;
-        SIZE_T heap_count = end - 1;
-        const ZipEntry* value = entries[0];
-
-        entries[0] = entries[heap_count];
-        entries[heap_count] = value;
-
-        while (heap_count > 1 && root <= (heap_count - 2) / 2) {
-            SIZE_T child = root * 2 + 1;
-
-            if (child + 1 < heap_count &&
-                zip_compare_entries(entries[child], entries[child + 1]) < 0) {
-                ++child;
-            }
-            if (zip_compare_entries(entries[root], entries[child]) >= 0) {
-                break;
-            }
-            value = entries[root];
-            entries[root] = entries[child];
-            entries[child] = value;
-            root = child;
-        }
-    }
-}
-
-BOOL ZipArchive_GetImageEntries(
-    const ZipArchive* archive,
-    const WCHAR* const* extensions,
-    SIZE_T extension_count,
-    const ZipEntry*** out_entries,
-    SIZE_T* out_count) {
-    SIZE_T count = 0;
-    SIZE_T index;
-    const ZipEntry** result;
-
-    if (out_entries == NULL || out_count == NULL ||
-        (extension_count != 0 && extensions == NULL)) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    *out_entries = NULL;
-    *out_count = 0;
-
-    if (!ZipArchive_IsOpen(archive)) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return FALSE;
-    }
-
-    for (index = 0; index < archive->entry_count; ++index) {
-        if (zip_name_has_extension(
-                archive->entries[index].name,
-                extensions,
-                extension_count)) {
-            ++count;
-        }
-    }
-    if (count == 0) {
-        return TRUE;
-    }
-    if (count > ((SIZE_T)-1) / sizeof(*result)) {
-        SetLastError(ERROR_OUTOFMEMORY);
-        return FALSE;
-    }
-
-    result = (const ZipEntry**)zip_heap_alloc(count * sizeof(*result));
-    if (result == NULL) {
-        SetLastError(ERROR_OUTOFMEMORY);
-        return FALSE;
-    }
-    count = 0;
-    for (index = 0; index < archive->entry_count; ++index) {
-        if (zip_name_has_extension(
-                archive->entries[index].name,
-                extensions,
-                extension_count)) {
-            result[count++] = archive->entries + index;
-        }
-    }
-
-    zip_sort_entry_list(result, count);
-    *out_entries = result;
-    *out_count = count;
-    return TRUE;
-}
-
-void ZipArchive_FreeEntryList(const ZipEntry** entries) {
-    zip_heap_free((void*)entries);
 }
 
 static BOOL zip_entry_belongs_to_archive(
@@ -1280,41 +1346,9 @@ BOOL ZipArchive_ExtractEntry(
         return FALSE;
     }
 
-    if (zip_crc32_bytes(output, (SIZE_T)entry->uncompressed_size) != entry->crc32) {
-        zip_heap_free(output);
-        SetLastError(ERROR_CRC);
-        return FALSE;
-    }
-
     *data = output;
     *size = (SIZE_T)entry->uncompressed_size;
     return TRUE;
-}
-
-BOOL ZipArchive_ExtractByName(
-    ZipArchive* archive,
-    LPCWSTR name,
-    ULONGLONG max_output_bytes,
-    BYTE** data,
-    SIZE_T* size) {
-    const ZipEntry* entry = ZipArchive_FindEntry(archive, name);
-
-    if (entry == NULL) {
-        if (data != NULL) {
-            *data = NULL;
-        }
-        if (size != NULL) {
-            *size = 0;
-        }
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
-    return ZipArchive_ExtractEntry(
-        archive,
-        entry,
-        max_output_bytes,
-        data,
-        size);
 }
 
 void ZipArchive_FreeBuffer(void* data) {

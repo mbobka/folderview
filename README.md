@@ -40,7 +40,7 @@ fview <path>
 
 ## Build with Docker
 
-FolderView is written in freestanding C and cross-compiled for windows-amd64 inside a **Linux** Docker container. The toolchain is `clang-cl` + `lld-link` + `llvm-rc`; Windows SDK headers and import libraries are fetched with [xwin](https://github.com/Jake-Shadle/xwin). The host machine only needs the source tree, Docker Desktop in Linux containers mode, and the exported binaries.
+FolderView is written in freestanding C and cross-compiled for windows-amd64 inside a **Linux** Docker container. The toolchain is `clang-cl` + `lld-link` + `llvm-rc`; Windows SDK headers and import libraries are fetched with [xwin](https://github.com/Jake-Shadle/xwin). The host machine only needs the source tree and Docker with BuildKit support.
 
 ```powershell
 .\build\Invoke-DockerBuild.ps1
