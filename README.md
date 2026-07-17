@@ -46,7 +46,7 @@ FolderView is written in freestanding C and cross-compiled for windows-amd64 ins
 .\build\Invoke-DockerBuild.ps1
 ```
 
-The output is written to `out-win-amd64\` and includes `FolderView.exe`, a portable ZIP, and a SHA256 file. The required `inflate` sources from zlib are compiled in `Z_SOLO` mode with WinAPI heap callbacks, so no `zlib1.dll` is shipped. The first build downloads the Windows SDK and toolchain, so it takes longer than later cached builds.
+The output is written to `out-win-amd64\` and includes `FolderView.exe`, license notices, a portable ZIP, and a SHA256 file. The required `inflate` sources from zlib are compiled in `Z_SOLO` mode with WinAPI heap callbacks, so no `zlib1.dll` is shipped. The portable ZIP includes the FolderView license and the zlib notice. The first build downloads the Windows SDK and toolchain, so it takes longer than later cached builds.
 
 To stamp a release version inside the container:
 
@@ -60,4 +60,5 @@ GitHub Actions release builds are created from `v*` tags and run on a Linux runn
 
 ## License
 
-MIT
+FolderView is distributed under the [MIT License](LICENSE). See
+[Third-Party Software Notices](THIRD-PARTY-NOTICES.txt) for the zlib license.
