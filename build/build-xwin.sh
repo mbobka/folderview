@@ -12,6 +12,8 @@ SRC_ROOT="${SRC_ROOT:-/src/FolderView}"
 PROJECT_DIR="$SRC_ROOT/FolderView"
 OUT_DIR="${OUT_DIR:-/out}"
 BUILD_DIR="${BUILD_DIR:-/tmp/folderview-build}"
+LICENSE_FILE="${LICENSE_FILE:-$SRC_ROOT/../LICENSE}"
+NOTICES_FILE="${NOTICES_FILE:-$SRC_ROOT/../THIRD-PARTY-NOTICES.txt}"
 
 XWIN_DIR="${XWIN_DIR:-/xwin}"
 ZLIB_DIR="${ZLIB_DIR:-/opt/zlib}"
@@ -154,16 +156,24 @@ fi
 
 STAGE_DIR="$BUILD_DIR/package"
 mkdir -p "$STAGE_DIR"
-cp "$OUT_DIR/FolderView.exe" "$STAGE_DIR/"
+cp "$LICENSE_FILE" "$OUT_DIR/LICENSE"
+cp "$NOTICES_FILE" "$OUT_DIR/THIRD-PARTY-NOTICES.txt"
+cp "$OUT_DIR/FolderView.exe" \
+    "$OUT_DIR/LICENSE" \
+    "$OUT_DIR/THIRD-PARTY-NOTICES.txt" \
+    "$STAGE_DIR/"
 
 ZIP_PATH="$OUT_DIR/$ZIP_NAME"
-( cd "$STAGE_DIR" && zip -q -X "$ZIP_PATH" FolderView.exe )
+( cd "$STAGE_DIR" && zip -q -X "$ZIP_PATH" \
+    FolderView.exe LICENSE THIRD-PARTY-NOTICES.txt )
 
 # Контроль содержимого пакета
-if ! unzip -l "$ZIP_PATH" | grep -q "FolderView.exe"; then
-    echo "[build] ERROR: package is missing FolderView.exe" >&2
-    exit 1
-fi
+for required in FolderView.exe LICENSE THIRD-PARTY-NOTICES.txt; do
+    if ! unzip -Z1 "$ZIP_PATH" | grep -Fxq "$required"; then
+        echo "[build] ERROR: package is missing required file: $required" >&2
+        exit 1
+    fi
+done
 for forbidden in FolderView.pdb msvcp140.dll vcruntime140.dll vcruntime140_1.dll zlib1.dll; do
     if unzip -l "$ZIP_PATH" | grep -q "$forbidden"; then
         echo "[build] ERROR: package contains forbidden file: $forbidden" >&2

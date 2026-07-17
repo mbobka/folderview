@@ -96,6 +96,7 @@ ENV CONFIGURATION=${CONFIGURATION} \
 
 WORKDIR /src
 COPY FolderView /src/FolderView
+COPY LICENSE THIRD-PARTY-NOTICES.txt /src/
 COPY build/build-xwin.sh /build/build-xwin.sh
 
 RUN chmod +x /build/build-xwin.sh && /build/build-xwin.sh
