@@ -3,7 +3,6 @@
 Lightweight image viewer for folders, ZIP archives, JPEG, PNG, and WebP files.
 
 FolderView opens an image file, folder, or archive and lets you browse images quickly with keyboard navigation.
-If a folder has no supported images at its top level, FolderView searches its subfolders for ZIP archives and opens the first valid archive.
 
 ## Install
 
