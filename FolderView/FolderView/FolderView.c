@@ -173,13 +173,11 @@ static ID2D1HwndRenderTarget *g_render_target;
 static ID2D1Bitmap *g_d2d_bitmap;
 static SIZE_T g_d2d_bitmap_image = ~(SIZE_T)0;
 static FvStringList g_files;
-static FvStringList g_zip_navigation;
 static DecodedImage *g_cache;
 static ZipArchive g_zip;
 static const ZipEntry **g_zip_entries;
 static BOOL g_zip_mode;
 static SIZE_T g_current_image;
-static SIZE_T g_current_zip;
 static BOOL g_block_navigation;
 static BOOL g_has_image_shift;
 static POINT g_image_shift;
@@ -776,66 +774,6 @@ static BOOL fv_enumerate_matching_files(
     return success;
 }
 
-static BOOL fv_enumerate_zip_files_recursive(
-    const WCHAR *directory,
-    FvStringList *destination) {
-    WCHAR *pattern = fv_join_path(directory, L"*");
-    WIN32_FIND_DATAW find_data;
-    HANDLE find_handle;
-    DWORD find_error;
-    BOOL success = TRUE;
-
-    if (pattern == NULL) {
-        return FALSE;
-    }
-
-    find_handle = FindFirstFileW(pattern, &find_data);
-    find_error = find_handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-    fv_heap_free(pattern);
-    if (find_handle == INVALID_HANDLE_VALUE) {
-        return find_error == ERROR_FILE_NOT_FOUND ||
-            find_error == ERROR_PATH_NOT_FOUND ||
-            find_error == ERROR_ACCESS_DENIED;
-    }
-
-    for (;;) {
-        WCHAR *full_path = NULL;
-
-        if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                lstrcmpW(find_data.cFileName, L".") != 0 &&
-                lstrcmpW(find_data.cFileName, L"..") != 0) {
-                full_path = fv_join_path(directory, find_data.cFileName);
-                if (full_path == NULL ||
-                    !fv_enumerate_zip_files_recursive(full_path, destination)) {
-                    success = FALSE;
-                }
-            }
-        } else if (fv_is_zip_file(find_data.cFileName)) {
-            full_path = fv_join_path(directory, find_data.cFileName);
-            if (full_path == NULL) {
-                success = FALSE;
-            } else if (!fv_string_list_add_owned(destination, full_path)) {
-                full_path = NULL;
-                success = FALSE;
-            } else {
-                full_path = NULL;
-            }
-        }
-
-        fv_heap_free(full_path);
-        if (!success || !FindNextFileW(find_handle, &find_data)) {
-            break;
-        }
-    }
-
-    if (success && GetLastError() != ERROR_NO_MORE_FILES) {
-        success = FALSE;
-    }
-    FindClose(find_handle);
-    return success;
-}
-
 static BOOL fv_build_disk_file_list(const WCHAR *input) {
     DWORD attributes = GetFileAttributesW(input);
     WCHAR *directory = NULL;
@@ -910,8 +848,7 @@ static BOOL fv_virtual_path_equal(const WCHAR *left, const WCHAR *right) {
 static BOOL fv_build_zip_file_list(
     const WCHAR *zip_path,
     const WCHAR *start_entry,
-    BOOL require_image,
-    BOOL report_open_error) {
+    BOOL require_image) {
     ZipArchive temporary_zip;
     FvStringList temporary_files;
     const ZipEntry **temporary_zip_entries = NULL;
@@ -925,13 +862,7 @@ static BOOL fv_build_zip_file_list(
     ZipArchive_Init(&temporary_zip);
     fv_string_list_init(&temporary_files);
     if (!ZipArchive_Open(&temporary_zip, zip_path)) {
-        if (report_open_error) {
-            MessageBoxW(
-                NULL,
-                L"Не удалось открыть ZIP-архив",
-                L"FolderView",
-                MB_OK | MB_ICONERROR);
-        }
+        MessageBoxW(NULL, L"Не удалось открыть ZIP-архив", L"FolderView", MB_OK | MB_ICONERROR);
         goto cleanup;
     }
 
@@ -962,7 +893,6 @@ static BOOL fv_build_zip_file_list(
     }
 
     if (require_image && temporary_files.count == 0) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
         goto cleanup;
     }
 
@@ -999,39 +929,6 @@ cleanup:
     fv_heap_free(temporary_zip_entries);
     fv_string_list_clear(&temporary_files);
     ZipArchive_Close(&temporary_zip);
-    return success;
-}
-
-static BOOL fv_open_first_zip_from_tree(const WCHAR *root) {
-    FvStringList archives;
-    SIZE_T index;
-    BOOL success = FALSE;
-
-    fv_string_list_init(&archives);
-    if (!fv_enumerate_zip_files_recursive(root, &archives)) {
-        goto cleanup;
-    }
-    fv_string_list_sort(&archives);
-
-    for (index = 0; index < archives.count; ++index) {
-        if (fv_build_zip_file_list(
-                archives.items[index],
-                NULL,
-                TRUE,
-                FALSE)) {
-            g_zip_navigation = archives;
-            fv_string_list_init(&archives);
-            g_current_zip = index;
-            success = TRUE;
-            break;
-        }
-        if (GetLastError() == ERROR_OUTOFMEMORY) {
-            break;
-        }
-    }
-
-cleanup:
-    fv_string_list_clear(&archives);
     return success;
 }
 
@@ -1559,30 +1456,6 @@ static void fv_switch_zip_file(HWND window, int direction) {
         return;
     }
 
-    if (g_zip_navigation.count != 0) {
-        SIZE_T next_index = g_current_zip;
-
-        for (;;) {
-            if (direction < 0 && next_index > 0) {
-                --next_index;
-            } else if (direction > 0 && next_index + 1 < g_zip_navigation.count) {
-                ++next_index;
-            } else {
-                return;
-            }
-
-            if (fv_build_zip_file_list(
-                    g_zip_navigation.items[next_index],
-                    NULL,
-                    TRUE,
-                    FALSE)) {
-                g_current_zip = next_index;
-                fv_set_current_image(window, TRUE);
-                return;
-            }
-        }
-    }
-
     fv_string_list_init(&zip_files);
     archive_path = fv_wide_duplicate(ZipArchive_Path(&g_zip));
     if (archive_path == NULL) {
@@ -1620,7 +1493,7 @@ static void fv_switch_zip_file(HWND window, int direction) {
         return;
     }
 
-    if (fv_build_zip_file_list(next_archive, NULL, TRUE, TRUE)) {
+    if (fv_build_zip_file_list(next_archive, NULL, TRUE)) {
         fv_set_current_image(window, TRUE);
     }
     fv_heap_free(next_archive);
@@ -1905,7 +1778,6 @@ static int fv_application_main(void) {
         return -1;
     }
     fv_string_list_init(&g_files);
-    fv_string_list_init(&g_zip_navigation);
     ZipArchive_Init(&g_zip);
     zip_initialized = TRUE;
 
@@ -1942,12 +1814,9 @@ static int fv_application_main(void) {
         goto cleanup;
     }
     if (fv_split_zip_virtual_path(root, &zip_path, &inner_entry)) {
-        loaded = fv_build_zip_file_list(zip_path, inner_entry, FALSE, TRUE);
+        loaded = fv_build_zip_file_list(zip_path, inner_entry, FALSE);
     } else {
         loaded = fv_build_disk_file_list(root);
-        if (loaded && g_files.count == 0) {
-            loaded = fv_open_first_zip_from_tree(root);
-        }
     }
     if (!loaded || g_files.count == 0) {
         goto cleanup;
@@ -2034,7 +1903,6 @@ cleanup:
         DeleteObject(background);
     }
     fv_clear_files_and_cache();
-    fv_string_list_clear(&g_zip_navigation);
     if (zip_initialized) {
         ZipArchive_Close(&g_zip);
     }
