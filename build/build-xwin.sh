@@ -10,6 +10,7 @@ ZIP_NAME="${ZIP_NAME:-}"
 
 SRC_ROOT="${SRC_ROOT:-/src/FolderView}"
 PROJECT_DIR="$SRC_ROOT/FolderView"
+TEST_DIR="${TEST_DIR:-$SRC_ROOT/tests}"
 OUT_DIR="${OUT_DIR:-/out}"
 BUILD_DIR="${BUILD_DIR:-/tmp/folderview-build}"
 LICENSE_FILE="${LICENSE_FILE:-$SRC_ROOT/../LICENSE}"
@@ -22,6 +23,29 @@ TARGET="x86_64-pc-windows-msvc"
 # --- Подготовка каталогов --------------------------------------------------
 rm -rf "$BUILD_DIR" "$OUT_DIR"
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
+
+# --- Нативные C-регрессии ---------------------------------------------------
+# Платформонезависимые части (разбор ZIP из памяти, расчёты декодирования и
+# кэша вьювера) проверяются нативно до Windows-сборки. UBSan в trap-режиме
+# не требует рантайма: UB (переполнения, сдвиги, выход за границы массивов)
+# роняет тест.
+NATIVE_TEST_FLAGS=(
+    -std=c17 -Wall -Wextra -Werror -pedantic
+    -fsanitize=undefined -fsanitize-trap=undefined
+    -I "$PROJECT_DIR"
+)
+
+echo "[build] native ZipFormat regression tests"
+clang "${NATIVE_TEST_FLAGS[@]}" \
+    "$PROJECT_DIR/ZipFormat.c" "$TEST_DIR/ZipFormatTests.c" \
+    -o "$BUILD_DIR/zip-format-tests"
+"$BUILD_DIR/zip-format-tests"
+
+echo "[build] native ViewerPlan regression tests"
+clang "${NATIVE_TEST_FLAGS[@]}" \
+    "$PROJECT_DIR/ViewerPlan.c" "$TEST_DIR/ViewerPlanTests.c" \
+    -o "$BUILD_DIR/viewer-plan-tests"
+"$BUILD_DIR/viewer-plan-tests"
 
 # --- Рабочая копия FolderView.rc + прошивка версии --------------------------
 # Исходный ресурс хранится в UTF-8. Версию штампуем в рабочей копии, чтобы не
@@ -87,7 +111,11 @@ CL_FLAGS=(
 SOURCES=(
     FolderView.c
     WicDecoder.c
+    ViewerLoader.c
+    ViewerPlan.c
     ZipArchive.c
+    ZipFormat.c
+    Trace.c
     NoCrt.c
 )
 
