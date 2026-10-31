@@ -1,7 +1,8 @@
 /*
  * Нативные регрессии чистых расчётов вьювера (ViewerPlan.c): целевой размер
  * декодирования под экран, масштаб DCT, передекодирование при зуме,
- * бюджет кэша и порядок вытеснения кадров.
+ * бюджет кэша и порядок вытеснения кадров, фоновая загрузка (ключи заданий,
+ * окно prefetch, бюджет prefetch, отбраковка устаревших результатов).
  */
 #include "ViewerPlan.h"
 
@@ -323,6 +324,319 @@ static int test_evictions_saturating_total(void) {
     return 0;
 }
 
+static FvPlanJobKey make_key(uint64_t generation, size_t index, uint32_t box, int reason) {
+    FvPlanJobKey key;
+
+    key.generation = generation;
+    key.index = index;
+    key.box_width = box;
+    key.box_height = box;
+    key.max_dimension = 16384;
+    key.reason = reason;
+    return key;
+}
+
+static int test_job_key_match(void) {
+    FvPlanJobKey keys[3];
+    FvPlanJobKey probe;
+
+    keys[0] = make_key(1, 5, 1440, FV_PLAN_REASON_CURRENT);
+    keys[1] = make_key(1, 6, 1440, FV_PLAN_REASON_PREFETCH);
+    keys[2] = make_key(1, 5, 5000, FV_PLAN_REASON_UPGRADE);
+
+    /* Причина не входит в ключ: prefetch того же кадра — то же задание. */
+    probe = make_key(1, 6, 1440, FV_PLAN_REASON_CURRENT);
+    EXPECT(FvPlan_FindJobKey(keys, 3, &probe) == 1);
+    /* Другая рамка (передекод при зуме) — другое задание. */
+    probe = make_key(1, 5, 5000, FV_PLAN_REASON_CURRENT);
+    EXPECT(FvPlan_FindJobKey(keys, 3, &probe) == 2);
+    /* Другое поколение списка — нет совпадения. */
+    probe = make_key(2, 5, 1440, FV_PLAN_REASON_CURRENT);
+    EXPECT(FvPlan_FindJobKey(keys, 3, &probe) == 3);
+    /* Другой предел стороны (новый render target) — другое задание. */
+    probe = keys[0];
+    probe.max_dimension = 8192;
+    EXPECT(!FvPlan_JobKeyEqual(&probe, &keys[0]));
+    EXPECT(FvPlan_FindJobKey(keys, 0, &probe) == 0);
+    return 0;
+}
+
+static int test_prefetch_order_forward_and_backward(void) {
+    size_t order[16];
+    size_t count;
+
+    /* Вперёд: +1, +2, +3, затем -1. */
+    count = FvPlan_PrefetchOrder(100, 10, 1, 3, 1, order, 16);
+    EXPECT(count == 4);
+    EXPECT(order[0] == 11 && order[1] == 12 && order[2] == 13 && order[3] == 9);
+
+    /* Назад: -1, -2, -3, затем +1. */
+    count = FvPlan_PrefetchOrder(100, 10, -1, 3, 1, order, 16);
+    EXPECT(count == 4);
+    EXPECT(order[0] == 9 && order[1] == 8 && order[2] == 7 && order[3] == 11);
+
+    /* Направление 0 (первый показ) — как вперёд. */
+    count = FvPlan_PrefetchOrder(100, 0, 0, 2, 1, order, 16);
+    EXPECT(count == 2);
+    EXPECT(order[0] == 1 && order[1] == 2);
+    return 0;
+}
+
+static int test_prefetch_order_respects_bounds(void) {
+    size_t order[16];
+    size_t count;
+
+    /* Конец списка (граница ZIP или папки): вперёд нечего, назад 1. */
+    count = FvPlan_PrefetchOrder(10, 9, 1, 3, 1, order, 16);
+    EXPECT(count == 1);
+    EXPECT(order[0] == 8);
+    /* Предпоследний: вперёд только 9. */
+    count = FvPlan_PrefetchOrder(10, 8, 1, 3, 2, order, 16);
+    EXPECT(count == 3);
+    EXPECT(order[0] == 9 && order[1] == 7 && order[2] == 6);
+    /* Начало списка при листании назад. */
+    count = FvPlan_PrefetchOrder(10, 0, -1, 3, 1, order, 16);
+    EXPECT(count == 1);
+    EXPECT(order[0] == 1);
+    /* Один кадр, пустой список, current вне списка. */
+    EXPECT(FvPlan_PrefetchOrder(1, 0, 1, 3, 1, order, 16) == 0);
+    EXPECT(FvPlan_PrefetchOrder(0, 0, 1, 3, 1, order, 16) == 0);
+    EXPECT(FvPlan_PrefetchOrder(5, 5, 1, 3, 1, order, 16) == 0);
+    /* Ограниченная ёмкость. */
+    count = FvPlan_PrefetchOrder(100, 50, 1, 3, 1, order, 2);
+    EXPECT(count == 2);
+    EXPECT(order[0] == 51 && order[1] == 52);
+    /* Пустое окно. */
+    EXPECT(FvPlan_PrefetchOrder(100, 50, 1, 0, 0, order, 16) == 0);
+    /* Крайние индексы без переполнения. */
+    count = FvPlan_PrefetchOrder(~(size_t)0, ~(size_t)0 - 1U, 1, 3, 1, order, 16);
+    EXPECT(count == 1);
+    EXPECT(order[0] == ~(size_t)0 - 2U);
+    return 0;
+}
+
+static int test_fit_prefetch_within_budget(void) {
+    uint64_t bytes[20] = {0};
+    size_t scratch[20];
+    size_t candidates[4] = {11, 12, 13, 9};
+    size_t accepted;
+
+    /* Текущий 10 (10 байт), кадр ~10 байт, бюджет 100: всё окно помещается. */
+    bytes[10] = 10;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 100, candidates, 4, 10, NULL, scratch);
+    EXPECT(accepted == 4);
+    EXPECT(bytes[11] == 10 && bytes[12] == 10 && bytes[13] == 10 && bytes[9] == 10);
+    return 0;
+}
+
+static int test_fit_prefetch_stops_before_thrashing(void) {
+    uint64_t bytes[20] = {0};
+    size_t scratch[20];
+    size_t candidates[4] = {11, 12, 13, 9};
+    size_t accepted;
+
+    /* Бюджет 35 на текущий 10 и кадры по 10: влезают только +1 и +2. */
+    bytes[10] = 10;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 35, candidates, 4, 10, NULL, scratch);
+    EXPECT(accepted == 2);
+    EXPECT(bytes[11] == 10 && bytes[12] == 10);
+    /* Отвергнутый кандидат не оставляет оценку в массиве. */
+    EXPECT(bytes[13] == 0 && bytes[9] == 0);
+    return 0;
+}
+
+static int test_fit_prefetch_evicts_only_far_frames(void) {
+    uint64_t bytes[20] = {0};
+    size_t scratch[20];
+    size_t candidates[4] = {11, 12, 13, 9};
+    size_t accepted;
+
+    /* Дальние кадры 0 и 19 вытесняются ради окна — это не раскачка. */
+    bytes[0] = 10;
+    bytes[19] = 10;
+    bytes[10] = 10;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 50, candidates, 4, 10, NULL, scratch);
+    EXPECT(accepted == 4);
+
+    /* Кадр внутри окна (-3, уже показанный) не вытесняется ради prefetch. */
+    {
+        uint64_t near_bytes[20] = {0};
+
+        near_bytes[10] = 10;
+        near_bytes[7] = 10;
+        accepted = FvPlan_FitPrefetch(near_bytes, 20, 10, 50, 40, candidates, 4, 10, NULL, scratch);
+        /*
+         * +1, +2 (сумма 40) — да; с +3 сумма 50 и первым (позади, на том же
+         * расстоянии 3) вытеснился бы кадр 7 — внутри окна, поэтому нет.
+         */
+        EXPECT(accepted == 2);
+        EXPECT(near_bytes[13] == 0 && near_bytes[7] == 10);
+    }
+    return 0;
+}
+
+static int test_fit_prefetch_cached_and_limits(void) {
+    uint64_t bytes[20] = {0};
+    size_t scratch[20];
+    size_t candidates[4] = {11, 12, 13, 9};
+    size_t bad_candidates[2] = {10, 11};
+    size_t accepted;
+
+    /* Уже закэшированный кандидат принимается без добавления памяти. */
+    bytes[10] = 10;
+    bytes[11] = 10;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 20, candidates, 4, 10, NULL, scratch);
+    EXPECT(accepted == 1);
+    EXPECT(bytes[11] == 10 && bytes[12] == 0);
+
+    /* Радиус кэша: кандидат дальше радиуса не берётся. */
+    {
+        uint64_t zero[20] = {0};
+
+        zero[10] = 1;
+        accepted = FvPlan_FitPrefetch(zero, 20, 10, 2, 1000, candidates, 4, 1, NULL, scratch);
+        EXPECT(accepted == 2);
+    }
+    /* Текущий кадр в списке кандидатов и некорректный current. */
+    EXPECT(FvPlan_FitPrefetch(bytes, 20, 10, 50, 1000, bad_candidates, 2, 1, NULL, scratch) == 0);
+    EXPECT(FvPlan_FitPrefetch(bytes, 20, 20, 50, 1000, candidates, 4, 1, NULL, scratch) == 0);
+    /* Сам текущий кадр больше бюджета: prefetch не начинается. */
+    {
+        uint64_t big[20] = {0};
+
+        big[10] = 500;
+        accepted = FvPlan_FitPrefetch(big, 20, 10, 50, 100, candidates, 4, 10, NULL, scratch);
+        EXPECT(accepted == 0);
+        EXPECT(big[11] == 0);
+    }
+    return 0;
+}
+
+/*
+ * Сценарий бесконечного prefetch: неразвёрнутое окно (полное разрешение), бюджет
+ * 512 МиБ, текущий кадр 100x100 (оценка ~80 КБ), сосед 12000x12000
+ * (~549 МиБ). По оценке сосед принимается, после декода вытесняется — без
+ * известного размера он заказывался бы снова и снова.
+ */
+static int test_fit_prefetch_mixed_sizes_no_loop(void) {
+    const uint64_t budget = 512 * MIB;
+    const uint64_t current_bytes = 100ULL * 100ULL * 4ULL;
+    const uint64_t estimate = current_bytes * 2ULL;
+    const uint64_t neighbour_bytes = 12000ULL * 12000ULL * 4ULL;
+    uint64_t bytes[20] = {0};
+    uint64_t known[20] = {0};
+    size_t scratch[20];
+    size_t candidates[1] = {11};
+    size_t accepted;
+    size_t evicted_count;
+
+    /* Оценка по текущему кадру: кандидат принят (это и давало цикл). */
+    bytes[10] = current_bytes;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, budget, candidates, 1, estimate, NULL, scratch);
+    EXPECT(accepted == 1);
+
+    /* После декода trim (тот же отбор) вытесняет его по бюджету. */
+    bytes[11] = neighbour_bytes;
+    evicted_count = FvPlan_SelectEvictions(bytes, 20, 10, 50, budget, scratch, 20, NULL);
+    EXPECT(evicted_count == 1 && scratch[0] == 11);
+
+    /* Фактический размер известен — повторного заказа нет. */
+    bytes[11] = 0;
+    known[11] = neighbour_bytes;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, budget, candidates, 1, estimate, known, scratch);
+    EXPECT(accepted == 0);
+    EXPECT(bytes[11] == 0);
+    return 0;
+}
+
+static int test_fit_prefetch_known_smaller_than_estimate(void) {
+    uint64_t bytes[20] = {0};
+    uint64_t known[20] = {0};
+    size_t scratch[20];
+    size_t candidates[2] = {11, 12};
+    size_t accepted;
+
+    /* Текущий кадр большой (оценка 60), соседи маленькие (известно 5). */
+    bytes[10] = 30;
+    known[11] = 5;
+    known[12] = 5;
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 50, candidates, 2, 60, NULL, scratch);
+    EXPECT(accepted == 0);
+    accepted = FvPlan_FitPrefetch(bytes, 20, 10, 50, 50, candidates, 2, 60, known, scratch);
+    EXPECT(accepted == 2);
+    EXPECT(bytes[11] == 5 && bytes[12] == 5);
+    return 0;
+}
+
+static int test_prefetch_suppression_context(void) {
+    FvPlanPrefetchContext recorded;
+    FvPlanPrefetchContext now;
+
+    recorded.generation = 3;
+    recorded.current = 10;
+    recorded.direction = 1;
+    recorded.ahead = 3;
+    recorded.behind = 1;
+    recorded.box_width = 0;
+    recorded.box_height = 0;
+    recorded.max_dimension = 16384;
+    recorded.budget = 512 * MIB;
+
+    /* Те же условия — кадр, вытесненный сразу после prefetch, не заказываем. */
+    now = recorded;
+    EXPECT(FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    EXPECT(!FvPlan_PrefetchSuppressed(0, &recorded, &now));
+    /* Направление — по знаку. */
+    now.direction = 2;
+    EXPECT(FvPlan_PrefetchSuppressed(1, &recorded, &now));
+
+    /* Любое изменение условий снимает подавление. */
+    now = recorded; now.generation = 4;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.current = 11;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.direction = -1;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.ahead = 2;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.behind = 0;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.box_width = 3840; now.box_height = 2160;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.max_dimension = 8192;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    now = recorded; now.budget = 1024 * MIB;
+    EXPECT(!FvPlan_PrefetchSuppressed(1, &recorded, &now));
+    return 0;
+}
+
+static int test_result_disposition(void) {
+    /* Пустой кэш, то же поколение — принимаем. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 0, 0, 960, 1440, 16384) == FV_PLAN_RESULT_ACCEPT);
+    /* Поколение сменилось (другой ZIP) — устарел. */
+    EXPECT(FvPlan_ResultDisposition(2, 3, 5, 10, 1, 0, 0, 960, 1440, 16384) == FV_PLAN_RESULT_STALE);
+    /* Индекс вне нового списка — устарел. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 10, 10, 1, 0, 0, 960, 1440, 16384) == FV_PLAN_RESULT_STALE);
+    /* Ошибка/отмена. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 0, 0, 0, 0, 0, 16384) == FV_PLAN_RESULT_FAILED);
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 0, 0, 0, 1440, 16384) == FV_PLAN_RESULT_FAILED);
+    /* Передекод при зуме: больше кэша — заменяем. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 960, 1440, 3334, 5000, 16384) == FV_PLAN_RESULT_ACCEPT);
+    /* Prefetch пришёл после передекода в полное разрешение — не нужен. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 3334, 5000, 960, 1440, 16384) == FV_PLAN_RESULT_REDUNDANT);
+    /* Тот же размер — не нужен. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 960, 1440, 960, 1440, 16384) == FV_PLAN_RESULT_REDUNDANT);
+    /* Кэш больше предела битмапа — уменьшенный результат нужен. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 20000, 10000, 8192, 4096, 8192) == FV_PLAN_RESULT_ACCEPT);
+    /* ... но не тот, что сам больше предела. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 20000, 10000, 16384, 8192, 8192) == FV_PLAN_RESULT_REDUNDANT);
+    /* Больше предела при кэше в пределе — не заменяем. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 4096, 2048, 16384, 8192, 8192) == FV_PLAN_RESULT_REDUNDANT);
+    /* Без предела. */
+    EXPECT(FvPlan_ResultDisposition(3, 3, 5, 10, 1, 4096, 2048, 16384, 8192, 0) == FV_PLAN_RESULT_ACCEPT);
+    return 0;
+}
+
 typedef struct TestCase {
     const char* name;
     int (*run)(void);
@@ -346,6 +660,17 @@ int main(void) {
         {"evictions_never_current", test_evictions_never_current},
         {"evictions_skip_empty_and_edges", test_evictions_skip_empty_and_edges},
         {"evictions_saturating_total", test_evictions_saturating_total},
+        {"job_key_match", test_job_key_match},
+        {"prefetch_order_forward_and_backward", test_prefetch_order_forward_and_backward},
+        {"prefetch_order_respects_bounds", test_prefetch_order_respects_bounds},
+        {"fit_prefetch_within_budget", test_fit_prefetch_within_budget},
+        {"fit_prefetch_stops_before_thrashing", test_fit_prefetch_stops_before_thrashing},
+        {"fit_prefetch_evicts_only_far_frames", test_fit_prefetch_evicts_only_far_frames},
+        {"fit_prefetch_cached_and_limits", test_fit_prefetch_cached_and_limits},
+        {"fit_prefetch_mixed_sizes_no_loop", test_fit_prefetch_mixed_sizes_no_loop},
+        {"fit_prefetch_known_smaller_than_estimate", test_fit_prefetch_known_smaller_than_estimate},
+        {"prefetch_suppression_context", test_prefetch_suppression_context},
+        {"result_disposition", test_result_disposition},
     };
     size_t index;
     size_t count = sizeof(tests) / sizeof(tests[0]);

@@ -275,3 +275,201 @@ size_t FvPlan_SelectEvictions(
     }
     return evicted_count;
 }
+
+int FvPlan_JobKeyEqual(const FvPlanJobKey* left, const FvPlanJobKey* right) {
+    return left->generation == right->generation &&
+        left->index == right->index &&
+        left->box_width == right->box_width &&
+        left->box_height == right->box_height &&
+        left->max_dimension == right->max_dimension;
+}
+
+size_t FvPlan_FindJobKey(const FvPlanJobKey* keys, size_t count, const FvPlanJobKey* key) {
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        if (FvPlan_JobKeyEqual(&keys[index], key)) {
+            return index;
+        }
+    }
+    return count;
+}
+
+size_t FvPlan_PrefetchOrder(
+    size_t count,
+    size_t current,
+    int direction,
+    size_t ahead,
+    size_t behind,
+    size_t* order,
+    size_t capacity) {
+    size_t written = 0;
+    size_t distance;
+    size_t before = current;
+    size_t after;
+
+    if (current >= count) {
+        return 0;
+    }
+    after = count - 1U - current;
+    /* Кадров позади/впереди меньше окна — окно обрезается границей списка. */
+    for (distance = 1; distance <= ahead && written < capacity; ++distance) {
+        if (direction < 0) {
+            if (distance > before) {
+                break;
+            }
+            order[written++] = current - distance;
+        } else {
+            if (distance > after) {
+                break;
+            }
+            order[written++] = current + distance;
+        }
+    }
+    for (distance = 1; distance <= behind && written < capacity; ++distance) {
+        if (direction < 0) {
+            if (distance > after) {
+                break;
+            }
+            order[written++] = current + distance;
+        } else {
+            if (distance > before) {
+                break;
+            }
+            order[written++] = current - distance;
+        }
+    }
+    return written;
+}
+
+static size_t fv_plan_distance(size_t left, size_t right) {
+    return left > right ? left - right : right - left;
+}
+
+size_t FvPlan_FitPrefetch(
+    uint64_t* bytes,
+    size_t count,
+    size_t current,
+    size_t radius,
+    uint64_t budget,
+    const size_t* candidates,
+    size_t candidate_count,
+    uint64_t estimate,
+    const uint64_t* known_bytes,
+    size_t* evicted_scratch) {
+    size_t accepted;
+    size_t window = 0;
+
+    if (current >= count) {
+        return 0;
+    }
+    for (accepted = 0; accepted < candidate_count; ++accepted) {
+        size_t candidate = candidates[accepted];
+        size_t distance;
+        size_t candidate_window;
+        size_t evicted_count;
+        size_t index;
+        int rejected = 0;
+
+        if (candidate >= count || candidate == current) {
+            break;
+        }
+        distance = fv_plan_distance(candidate, current);
+        if (distance > radius) {
+            break;
+        }
+        candidate_window = distance > window ? distance : window;
+        if (bytes[candidate] != 0) {
+            /* Уже в кэше: расширяет окно, памяти не добавляет. */
+            window = candidate_window;
+            continue;
+        }
+
+        /* Известный по прежнему декоду размер точнее оценки по текущему кадру. */
+        {
+            uint64_t expected = known_bytes != NULL && known_bytes[candidate] != 0
+                ? known_bytes[candidate]
+                : estimate;
+
+            /* Оценка 0 (пустой кадр) не отличалась бы от «не в кэше». */
+            bytes[candidate] = expected != 0 ? expected : 1U;
+        }
+        evicted_count = FvPlan_SelectEvictions(
+            bytes,
+            count,
+            current,
+            radius,
+            budget,
+            evicted_scratch,
+            count,
+            NULL);
+        for (index = 0; index < evicted_count; ++index) {
+            if (fv_plan_distance(evicted_scratch[index], current) <= candidate_window) {
+                rejected = 1;
+                break;
+            }
+        }
+        if (rejected) {
+            bytes[candidate] = 0;
+            break;
+        }
+        window = candidate_window;
+    }
+    return accepted;
+}
+
+int FvPlan_PrefetchContextEqual(
+    const FvPlanPrefetchContext* left,
+    const FvPlanPrefetchContext* right) {
+    return left->generation == right->generation &&
+        left->current == right->current &&
+        (left->direction < 0) == (right->direction < 0) &&
+        left->ahead == right->ahead &&
+        left->behind == right->behind &&
+        left->box_width == right->box_width &&
+        left->box_height == right->box_height &&
+        left->max_dimension == right->max_dimension &&
+        left->budget == right->budget;
+}
+
+int FvPlan_PrefetchSuppressed(
+    int suppressed,
+    const FvPlanPrefetchContext* recorded,
+    const FvPlanPrefetchContext* now) {
+    return suppressed && FvPlan_PrefetchContextEqual(recorded, now);
+}
+
+int FvPlan_ResultDisposition(
+    uint64_t job_generation,
+    uint64_t current_generation,
+    size_t index,
+    size_t count,
+    int succeeded,
+    uint32_t cached_width,
+    uint32_t cached_height,
+    uint32_t result_width,
+    uint32_t result_height,
+    uint32_t max_dimension) {
+    if (job_generation != current_generation || index >= count) {
+        return FV_PLAN_RESULT_STALE;
+    }
+    if (!succeeded || result_width == 0 || result_height == 0) {
+        return FV_PLAN_RESULT_FAILED;
+    }
+    if (cached_width == 0 || cached_height == 0) {
+        return FV_PLAN_RESULT_ACCEPT;
+    }
+    if (max_dimension != 0 &&
+        (cached_width > max_dimension || cached_height > max_dimension)) {
+        return result_width <= max_dimension && result_height <= max_dimension
+            ? FV_PLAN_RESULT_ACCEPT
+            : FV_PLAN_RESULT_REDUNDANT;
+    }
+    if (max_dimension != 0 &&
+        (result_width > max_dimension || result_height > max_dimension)) {
+        return FV_PLAN_RESULT_REDUNDANT;
+    }
+    return result_width > cached_width || result_height > cached_height
+        ? FV_PLAN_RESULT_ACCEPT
+        : FV_PLAN_RESULT_REDUNDANT;
+}

@@ -1031,17 +1031,19 @@ failure:
     return FALSE;
 }
 
+static BOOL zip_extract_entry(
+    ZipArchive* archive,
+    const ZipEntry* entry,
+    ULONGLONG max_output_bytes,
+    BYTE** data,
+    SIZE_T* size);
+
 BOOL ZipArchive_ExtractEntry(
     ZipArchive* archive,
     const ZipEntry* entry,
     ULONGLONG max_output_bytes,
     BYTE** data,
     SIZE_T* size) {
-    BYTE* block = NULL;
-    SIZE_T block_size = 0;
-    SIZE_T data_offset = 0;
-    DWORD error;
-
     if (data == NULL || size == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -1054,6 +1056,99 @@ BOOL ZipArchive_ExtractEntry(
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    return zip_extract_entry(archive, entry, max_output_bytes, data, size);
+}
+
+BOOL ZipArchive_DuplicateFile(const ZipArchive* archive, HANDLE* file) {
+    HANDLE process = GetCurrentProcess();
+
+    if (file == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    *file = INVALID_HANDLE_VALUE;
+    if (!ZipArchive_IsOpen(archive)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (!DuplicateHandle(process, archive->file, process, file, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        *file = INVALID_HANDLE_VALUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void ZipReadScratch_Init(ZipReadScratch* scratch) {
+    if (scratch == NULL) {
+        return;
+    }
+    scratch->input_buffer = NULL;
+    scratch->input_capacity = 0;
+    ZeroMemory(&scratch->io, sizeof(scratch->io));
+}
+
+void ZipReadScratch_Free(ZipReadScratch* scratch) {
+    if (scratch == NULL) {
+        return;
+    }
+    zip_heap_free(scratch->input_buffer);
+    ZipReadScratch_Init(scratch);
+}
+
+BOOL ZipArchive_ExtractEntryFromFile(
+    HANDLE file,
+    ULONGLONG file_size,
+    const ZipEntry* entry,
+    ULONGLONG max_output_bytes,
+    ZipReadScratch* scratch,
+    BYTE** data,
+    SIZE_T* size) {
+    ZipArchive reader;
+    BOOL extracted;
+    DWORD error;
+
+    if (data == NULL || size == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    *data = NULL;
+    *size = 0;
+    if (file == NULL || file == INVALID_HANDLE_VALUE || entry == NULL || scratch == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    /*
+     * Временный «архив» без записей поверх чужого хэндла: только для
+     * позиционного чтения. Close для него не вызывается — хэндлом и буфером
+     * владеют вызывающий и scratch.
+     */
+    ZipArchive_Init(&reader);
+    reader.file = file;
+    reader.file_size = file_size;
+    reader.input_buffer = scratch->input_buffer;
+    reader.input_capacity = scratch->input_capacity;
+    reader.io = scratch->io;
+    extracted = zip_extract_entry(&reader, entry, max_output_bytes, data, size);
+    error = GetLastError();
+    scratch->input_buffer = reader.input_buffer;
+    scratch->input_capacity = reader.input_capacity;
+    scratch->io = reader.io;
+    SetLastError(error);
+    return extracted;
+}
+
+static BOOL zip_extract_entry(
+    ZipArchive* archive,
+    const ZipEntry* entry,
+    ULONGLONG max_output_bytes,
+    BYTE** data,
+    SIZE_T* size) {
+    BYTE* block = NULL;
+    SIZE_T block_size = 0;
+    SIZE_T data_offset = 0;
+    DWORD error;
+
     if ((entry->flags & ZIP_FLAG_ENCRYPTED) != 0 ||
         (entry->compression_method != ZIP_METHOD_STORED &&
             entry->compression_method != ZIP_METHOD_DEFLATE)) {

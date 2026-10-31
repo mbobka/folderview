@@ -16,6 +16,7 @@
 
 #include "ImageDecoder.h"
 #include "Trace.h"
+#include "ViewerLoader.h"
 #include "ViewerPlan.h"
 #include "ZipArchive.h"
 
@@ -142,7 +143,7 @@ struct ID2D1HwndRenderTarget {
 
 typedef struct FvIUnknownVtbl {
     FvD2DUnusedMethod QueryInterface;
-    FvD2DUnusedMethod AddRef;
+    ULONG (STDMETHODCALLTYPE *AddRef)(void *self);
     ULONG (STDMETHODCALLTYPE *Release)(void *self);
 } FvIUnknownVtbl;
 
@@ -161,7 +162,11 @@ struct ID2D1Bitmap {
 #define FV_CACHE_RADIUS ((SIZE_T)50)
 /* Максимальный размер D2D-битмапа до создания render target (типичный). */
 #define FV_DEFAULT_MAX_BITMAP_SIZE ((UINT32)16384)
-#define FV_MAX_ZIP_IMAGE_BYTES ((ULONGLONG)1024 * 1024 * 1024)
+#define FV_MAX_ZIP_IMAGE_BYTES FV_LOADER_MAX_ZIP_IMAGE_BYTES
+/* Уведомление рабочего потока: есть завершённые задания (ViewerLoader.h). */
+#define WM_FV_LOADED (WM_APP + 1)
+/* Окно prefetch плюс текущий кадр и передекод. */
+#define FV_MAX_LOAD_REQUESTS ((SIZE_T)(2U * FV_PLAN_PREFETCH_MAX + 2U))
 
 typedef struct FvStringList {
     WCHAR **items;
@@ -185,6 +190,22 @@ typedef struct FvCacheEntry {
     DecodedImage image;
     ID2D1Bitmap *bitmap;
     SIZE_T bitmap_bytes;
+    /*
+     * Фоновая загрузка кадра не удалась: prefetch его больше не просит,
+     * текущим кадром он перезапрашивается только при явном переходе к нему.
+     */
+    BOOL load_failed;
+    /*
+     * Фактический размер кадра в кэше (пиксели + битмап) после фонового
+     * декода под рамку known_box_*: переживает вытеснение (в пределах
+     * поколения — кэш пересоздаётся со списком) и заменяет в бюджете
+     * prefetch оценку по текущему кадру (FvPlan_FitPrefetch).
+     */
+    ULONGLONG known_bytes;
+    UINT known_box_width;
+    UINT known_box_height;
+    /* Вытеснен по бюджету сразу после prefetch: не заказывать при тех же условиях. */
+    BOOL prefetch_suppressed;
 } FvCacheEntry;
 
 static HANDLE g_heap;
@@ -212,6 +233,36 @@ static FLOAT g_scale = 1.0f;
 static ULONGLONG g_trace_frame_started;
 static BOOL g_trace_frame_pending;
 static BOOL g_trace_first_paint_done;
+/*
+ * Фоновая загрузка. g_generation — поколение списка кадров: меняется
+ * при каждой смене g_files/g_cache (ZIP, папка), результаты чужого
+ * поколения отбрасываются. g_loader_archive — ссылка UI-потока на дубликат
+ * хэндла g_zip для рабочего потока.
+ */
+static BOOL g_loader_active;
+static ULONGLONG g_generation;
+static FvLoaderArchive *g_loader_archive;
+/* Текущий кадр показан (масштаб, заголовок, размер окна посчитаны по нему). */
+static BOOL g_current_activated;
+/* Направление последнего перехода: +1 вперёд, -1 назад (окно prefetch). */
+static int g_nav_direction = 1;
+static SIZE_T g_prefetch_ahead = FV_PLAN_PREFETCH_AHEAD;
+static SIZE_T g_prefetch_behind = FV_PLAN_PREFETCH_BEHIND;
+/*
+ * Условия, при которых кадры с FvCacheEntry.prefetch_suppressed были
+ * вытеснены сразу после prefetch; при других условиях пометки снимаются.
+ */
+static FvPlanPrefetchContext g_prefetch_suppress_context;
+static BOOL g_prefetch_suppress_any;
+/* Зум и 1:1, нажатые до готовности кадра: применяются при его показе. */
+static int g_deferred_zoom_steps;
+static BOOL g_deferred_actual_size;
+/*
+ * Последний показанный кадр (своя ссылка на битмап и прямоугольник): его
+ * рисует отрисовка, пока новый текущий кадр загружается, — без серого фона.
+ */
+static ID2D1Bitmap *g_shown_bitmap;
+static D2D1_RECT_F g_shown_rect;
 
 /* Микросекунды как "мс.ддд" для wsprintfW: формат FV_MS, аргументы FV_MS_ARGS. */
 #define FV_MS L"%I64u.%03I64u"
@@ -226,6 +277,8 @@ static void fv_draw_image(HWND window);
 static void fv_update_window_title(HWND window);
 static void fv_release_entry_bitmap(FvCacheEntry *entry);
 static void fv_release_all_bitmaps(void);
+static void fv_cancel_loads(void);
+static void fv_schedule_loads(HWND window);
 
 static BOOL fv_size_multiply(SIZE_T left, SIZE_T right, SIZE_T *result) {
     SIZE_T maximum = ~(SIZE_T)0;
@@ -737,6 +790,9 @@ static void fv_free_cache(void) {
 }
 
 static void fv_clear_files_and_cache(void) {
+    /* Индексы и записи прежнего списка больше не действительны. */
+    ++g_generation;
+    fv_cancel_loads();
     fv_free_cache();
     fv_string_list_clear(&g_files);
     fv_heap_free(g_zip_entries);
@@ -919,6 +975,23 @@ static void fv_trace_zip_open(const ZipArchive *archive, ULONGLONG started) {
         FvTrace_Tail(ZipArchive_Path(archive), FV_TRACE_PATH_CHARS));
 }
 
+/*
+ * Ссылка рабочего потока на открытый g_zip: дубликат хэндла (тот же file
+ * object, без нового сетевого открытия). Пересоздаётся при каждом новом
+ * открытии g_zip; при переиспользовании того же ZIP (fv_can_reuse_open_zip,
+ * сверка размера и времени изменения) остаётся прежней.
+ */
+static void fv_refresh_loader_archive(void) {
+    FvLoaderArchive_Release(g_loader_archive);
+    g_loader_archive = NULL;
+    if (g_loader_active && g_zip_mode && ZipArchive_IsOpen(&g_zip)) {
+        g_loader_archive = FvLoaderArchive_Create(&g_zip);
+        if (g_loader_archive == NULL && FV_TRACE_ENABLED()) {
+            FvTrace_Printf(L"loader-archive-failed error=%lu", GetLastError());
+        }
+    }
+}
+
 static BOOL fv_can_reuse_open_zip(const WCHAR *zip_path) {
     const WCHAR *open_path;
 
@@ -1048,6 +1121,9 @@ static BOOL fv_build_zip_file_list(
     temporary_cache = NULL;
     g_current_image = temporary_current_image;
     g_zip_mode = TRUE;
+    if (!reuse_open_zip || g_loader_archive == NULL) {
+        fv_refresh_loader_archive();
+    }
     success = TRUE;
 
 cleanup:
@@ -1159,9 +1235,6 @@ static void fv_update_window_title(HWND window) {
         return;
     }
     image = &g_cache[g_current_image].image;
-    if (!DecodedImage_IsValid(image)) {
-        return;
-    }
 
     title.data = NULL;
     title.length = 0;
@@ -1171,15 +1244,20 @@ static void fv_update_window_title(HWND window) {
         fv_builder_append(&title, L" -> ");
     }
     fv_builder_append(&title, g_files.items[g_current_image]);
-    /* Размер исходного кадра: декодированный буфер может быть меньше. */
-    fv_builder_append(&title, L" [");
-    fv_builder_append_u64(&title, image->source_width);
-    fv_builder_append(&title, L"x");
-    fv_builder_append_u64(&title, image->source_height);
-    fv_builder_append(&title, image->has_alpha ? L" RGBA] " : L" RGB] ");
-    percentage = (ULONGLONG)(g_scale * 100.0f + 0.5f);
-    fv_builder_append_u64(&title, percentage);
-    fv_builder_append(&title, L"%");
+    if (DecodedImage_IsValid(image) && (g_current_activated || !g_loader_active)) {
+        /* Размер исходного кадра: декодированный буфер может быть меньше. */
+        fv_builder_append(&title, L" [");
+        fv_builder_append_u64(&title, image->source_width);
+        fv_builder_append(&title, L"x");
+        fv_builder_append_u64(&title, image->source_height);
+        fv_builder_append(&title, image->has_alpha ? L" RGBA] " : L" RGB] ");
+        percentage = (ULONGLONG)(g_scale * 100.0f + 0.5f);
+        fv_builder_append_u64(&title, percentage);
+        fv_builder_append(&title, L"%");
+    } else {
+        /* Кадр ещё загружается (фоновый декод): размер и масштаб неизвестны. */
+        fv_builder_append(&title, L" [...]");
+    }
 
     if (title.data != NULL) {
         SetWindowTextW(window, title.data);
@@ -1195,10 +1273,18 @@ static void fv_release_entry_bitmap(FvCacheEntry *entry) {
     entry->bitmap_bytes = 0;
 }
 
+static void fv_release_shown_bitmap(void) {
+    if (g_shown_bitmap != NULL) {
+        FV_UNKNOWN_VT(g_shown_bitmap)->Release(g_shown_bitmap);
+        g_shown_bitmap = NULL;
+    }
+}
+
 /* Все битмапы принадлежат render target: при его пересоздании они недействительны. */
 static void fv_release_all_bitmaps(void) {
     SIZE_T index;
 
+    fv_release_shown_bitmap();
     if (g_cache == NULL) {
         return;
     }
@@ -1398,7 +1484,7 @@ static HRESULT fv_decode_image(SIZE_T index, UINT box_width, UINT box_height, co
             ZipArchive_GetIoStats(&g_zip, &io_after);
             FvTrace_Printf(
                 L"entry-read index=%I64u ms=" FV_MS
-                L" bytes=%I64u compressed=%I64u method=%u reads=%I64u read_bytes=%I64u error=%lu",
+                L" bytes=%I64u compressed=%I64u method=%u reads=%I64u read_bytes=%I64u error=%lu thread=ui",
                 (ULONGLONG)index,
                 FV_MS_ARGS(elapsed_us),
                 (ULONGLONG)size,
@@ -1428,7 +1514,7 @@ static HRESULT fv_decode_image(SIZE_T index, UINT box_width, UINT box_height, co
         FvTrace_Printf(
             L"decode index=%I64u ms=" FV_MS L" hr=0x%08lX reason=%s width=%u height=%u "
             L"src_width=%u src_height=%u box=%ux%u max=%u dct=1/%u dct_size=%ux%u scaled=%d "
-            L"bytes=%I64u open_ms=" FV_MS L" pixels_ms=" FV_MS,
+            L"bytes=%I64u open_ms=" FV_MS L" pixels_ms=" FV_MS L" thread=ui",
             (ULONGLONG)index,
             FV_MS_ARGS(elapsed_us),
             (DWORD)result,
@@ -1465,32 +1551,53 @@ static HRESULT fv_decode_image(SIZE_T index, UINT box_width, UINT box_height, co
  * (например, после пересоздания render target) — вниз до предела. Соседи в
  * кэше остаются уменьшенными.
  */
-static void fv_ensure_current_resolution(void) {
+/* Нужен ли текущему кадру передекод под масштаб показа; размер — в display_*. */
+static BOOL fv_current_needs_upgrade(UINT *display_width, UINT *display_height) {
     const DecodedImage *image;
-    UINT display_width;
-    UINT display_height;
 
+    *display_width = 0;
+    *display_height = 0;
     if (g_cache == NULL || g_current_image >= g_files.count) {
-        return;
+        return FALSE;
     }
     image = &g_cache[g_current_image].image;
     if (!DecodedImage_IsValid(image)) {
-        return;
+        return FALSE;
     }
-    display_width = fv_display_extent(image->source_width);
-    display_height = fv_display_extent(image->source_height);
+    *display_width = fv_display_extent(image->source_width);
+    *display_height = fv_display_extent(image->source_height);
     if (!FvPlan_NeedsRedecode(
             image->source_width,
             image->source_height,
             image->width,
             image->height,
-            display_width,
-            display_height,
+            *display_width,
+            *display_height,
             g_max_bitmap_size)) {
+        return FALSE;
+    }
+    /* Неудачу не повторяем на каждой перерисовке (панорама): до смены кадра. */
+    return g_upgrade_failed_image != g_current_image;
+}
+
+/* Фоновая загрузка доступна: поток запущен, а для ZIP есть ссылка на архив. */
+static BOOL fv_async_available(void) {
+    return g_loader_active && (!g_zip_mode || g_loader_archive != NULL);
+}
+
+static void fv_ensure_current_resolution(HWND window) {
+    UINT display_width;
+    UINT display_height;
+
+    if (!g_current_activated || !fv_current_needs_upgrade(&display_width, &display_height)) {
         return;
     }
-    if (g_upgrade_failed_image == g_current_image) {
-        /* Неудачу не повторяем на каждой перерисовке (панорама): до смены кадра. */
+    if (fv_async_available()) {
+        /*
+         * Передекод — в рабочем потоке: до его готовности показывается
+         * уменьшенный кадр, растянутый D2D; готовый заменит его в кэше.
+         */
+        fv_schedule_loads(window);
         return;
     }
     /* Показ больше половины кадра даёт полное разрешение (FvPlan_DecodeTarget). */
@@ -1501,47 +1608,284 @@ static void fv_ensure_current_resolution(void) {
     }
 }
 
-static void fv_set_current_image(HWND window, BOOL repaint) {
-    DecodedImage *image;
-    WINDOWPLACEMENT placement;
+static void fv_cancel_loads(void) {
+    if (g_loader_active) {
+        FvLoader_Replace(NULL, 0);
+    }
+}
 
-    if (g_cache == NULL || g_current_image >= g_files.count) {
+/* Байт на кадр по оценке: пиксели под рамку плюс такой же D2D-битмап. */
+static ULONGLONG fv_prefetch_estimate(const DecodedImage *image, UINT box_width, UINT box_height) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    FvPlan_DecodeTarget(
+        image->source_width,
+        image->source_height,
+        box_width,
+        box_height,
+        g_max_bitmap_size,
+        &width,
+        &height);
+    return (ULONGLONG)width * (ULONGLONG)height * 4ULL * 2ULL;
+}
+
+/* Текущие условия prefetch (для подавления повторного заказа вытесненных кадров). */
+static FvPlanPrefetchContext fv_prefetch_context(UINT box_width, UINT box_height) {
+    FvPlanPrefetchContext context;
+
+    ZeroMemory(&context, sizeof(context));
+    context.generation = g_generation;
+    context.current = g_current_image;
+    context.direction = g_nav_direction;
+    context.ahead = g_prefetch_ahead;
+    context.behind = g_prefetch_behind;
+    context.box_width = box_width;
+    context.box_height = box_height;
+    context.max_dimension = g_max_bitmap_size;
+    context.budget = g_cache_budget;
+    return context;
+}
+
+/* Условия сменились — пометки «вытеснен сразу после prefetch» больше не действуют. */
+static void fv_refresh_prefetch_suppression(const FvPlanPrefetchContext *now) {
+    SIZE_T index;
+
+    if (!g_prefetch_suppress_any ||
+        FvPlan_PrefetchContextEqual(&g_prefetch_suppress_context, now)) {
+        return;
+    }
+    if (g_cache != NULL) {
+        for (index = 0; index < g_files.count; ++index) {
+            g_cache[index].prefetch_suppressed = FALSE;
+        }
+    }
+    g_prefetch_suppress_any = FALSE;
+}
+
+/*
+ * Окно prefetch вокруг текущего кадра по направлению листания, обрезанное
+ * бюджетом кэша (FvPlan_FitPrefetch): в requests дописываются задания для
+ * кадров, которых ещё нет в кэше. Размер соседа — фактический, если он уже
+ * декодировался под эту рамку, иначе оценка по текущему кадру; кадр,
+ * вытесненный сразу после prefetch при тех же условиях, не заказывается.
+ * Возвращает новое число заданий.
+ */
+static SIZE_T fv_add_prefetch_requests(
+    FvLoadRequest *requests,
+    SIZE_T request_count,
+    UINT box_width,
+    UINT box_height) {
+    size_t candidates[2 * FV_PLAN_PREFETCH_MAX];
+    size_t candidate_count;
+    size_t accepted;
+    SIZE_T count = g_files.count;
+    SIZE_T array_bytes;
+    ULONGLONG *bytes = NULL;
+    ULONGLONG *known = NULL;
+    size_t *scratch = NULL;
+    SIZE_T index;
+    FvPlanPrefetchContext context = fv_prefetch_context(box_width, box_height);
+
+    fv_refresh_prefetch_suppression(&context);
+    candidate_count = FvPlan_PrefetchOrder(
+        count,
+        g_current_image,
+        g_nav_direction,
+        g_prefetch_ahead,
+        g_prefetch_behind,
+        candidates,
+        sizeof(candidates) / sizeof(candidates[0]));
+    if (candidate_count == 0 ||
+        !fv_size_multiply(count, sizeof(*bytes), &array_bytes)) {
+        return request_count;
+    }
+    bytes = (ULONGLONG *)fv_heap_allocate(array_bytes, FALSE);
+    known = (ULONGLONG *)fv_heap_allocate(array_bytes, FALSE);
+    scratch = (size_t *)fv_heap_allocate(count * sizeof(*scratch), FALSE);
+    if (bytes == NULL || known == NULL || scratch == NULL) {
+        fv_heap_free(bytes);
+        fv_heap_free(known);
+        fv_heap_free(scratch);
+        return request_count;
+    }
+    for (index = 0; index < count; ++index) {
+        const FvCacheEntry *entry = &g_cache[index];
+
+        bytes[index] = (ULONGLONG)entry->image.pixels_size + (ULONGLONG)entry->bitmap_bytes;
+        known[index] = entry->known_box_width == box_width &&
+                entry->known_box_height == box_height
+            ? entry->known_bytes
+            : 0;
+    }
+    accepted = FvPlan_FitPrefetch(
+        (uint64_t *)bytes,
+        count,
+        g_current_image,
+        FV_CACHE_RADIUS,
+        g_cache_budget,
+        candidates,
+        candidate_count,
+        fv_prefetch_estimate(&g_cache[g_current_image].image, box_width, box_height),
+        (const uint64_t *)known,
+        scratch);
+    fv_heap_free(bytes);
+    fv_heap_free(known);
+    fv_heap_free(scratch);
+
+    for (index = 0; index < accepted && request_count < FV_MAX_LOAD_REQUESTS; ++index) {
+        SIZE_T candidate = candidates[index];
+        FvLoadRequest *request;
+
+        if (DecodedImage_IsValid(&g_cache[candidate].image) || g_cache[candidate].load_failed ||
+            FvPlan_PrefetchSuppressed(
+                g_cache[candidate].prefetch_suppressed,
+                &g_prefetch_suppress_context,
+                &context)) {
+            continue;
+        }
+        request = &requests[request_count++];
+        ZeroMemory(request, sizeof(*request));
+        request->index = candidate;
+        request->generation = g_generation;
+        request->reason = FV_PLAN_REASON_PREFETCH;
+        request->box_width = box_width;
+        request->box_height = box_height;
+        request->max_dimension = g_max_bitmap_size;
+        if (g_zip_mode) {
+            request->archive = g_loader_archive;
+            request->entry = g_zip_entries[candidate];
+        } else {
+            request->path = g_files.items[candidate];
+        }
+    }
+    return request_count;
+}
+
+/*
+ * План фоновой загрузки — заново после каждого изменения состояния
+ * (переход, готовый результат, зум): текущий кадр, если его нет; иначе
+ * передекод при зуме и окно prefetch. FvLoader_Replace сам сохраняет уже
+ * поставленные задания и отменяет ненужные (кадры, с которых ушли).
+ */
+static void fv_schedule_loads(HWND window) {
+    FvLoadRequest requests[FV_MAX_LOAD_REQUESTS];
+    SIZE_T request_count = 0;
+    FvCacheEntry *entry;
+    UINT box_width;
+    UINT box_height;
+
+    if (!fv_async_available()) {
+        return;
+    }
+    if (g_cache == NULL || g_current_image >= g_files.count ||
+        (g_zip_mode && g_zip_entries == NULL)) {
+        FvLoader_Replace(NULL, 0);
         return;
     }
 
-    g_has_image_shift = FALSE;
-    g_image_shift.x = 0;
-    g_image_shift.y = 0;
-    g_upgrade_failed_image = ~(SIZE_T)0;
-    image = &g_cache[g_current_image].image;
-    if (FV_TRACE_ENABLED()) {
-        g_trace_frame_started = FvTrace_Now();
-        g_trace_frame_pending = TRUE;
-        FvTrace_Printf(
-            L"frame-request index=%I64u cached=%d bitmap=%d",
-            (ULONGLONG)g_current_image,
-            DecodedImage_IsValid(image) ? 1 : 0,
-            g_cache[g_current_image].bitmap != NULL ? 1 : 0);
-    }
-    if (!DecodedImage_IsValid(image)) {
-        UINT box_width;
-        UINT box_height;
+    fv_decode_box(window, &box_width, &box_height);
+    entry = &g_cache[g_current_image];
+    if (!DecodedImage_IsValid(&entry->image)) {
+        if (!entry->load_failed) {
+            FvLoadRequest *request = &requests[request_count++];
 
-        fv_decode_box(window, &box_width, &box_height);
-        if (FAILED(fv_decode_image(g_current_image, box_width, box_height, L"new")) ||
-            !DecodedImage_IsValid(image)) {
-            MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
-            if (repaint) {
-                InvalidateRect(window, NULL, FALSE);
-            }
-            return;
+            ZeroMemory(request, sizeof(*request));
+            request->index = g_current_image;
+            request->reason = FV_PLAN_REASON_CURRENT;
+            request->box_width = box_width;
+            request->box_height = box_height;
+        }
+        /* Пока текущего кадра нет, соседей не грузим: важен только он. */
+    } else {
+        UINT display_width;
+        UINT display_height;
+
+        if (g_current_activated && fv_current_needs_upgrade(&display_width, &display_height)) {
+            FvLoadRequest *request = &requests[request_count++];
+
+            ZeroMemory(request, sizeof(*request));
+            request->index = g_current_image;
+            request->reason = FV_PLAN_REASON_UPGRADE;
+            request->box_width = display_width;
+            request->box_height = display_height;
+        }
+        request_count = fv_add_prefetch_requests(requests, request_count, box_width, box_height);
+    }
+    /* Общие поля текущего кадра (prefetch заполняет свои сам). */
+    if (request_count != 0 && requests[0].index == g_current_image &&
+        requests[0].reason != FV_PLAN_REASON_PREFETCH) {
+        requests[0].generation = g_generation;
+        requests[0].max_dimension = g_max_bitmap_size;
+        if (g_zip_mode) {
+            requests[0].archive = g_loader_archive;
+            requests[0].entry = g_zip_entries[g_current_image];
+        } else {
+            requests[0].path = g_files.items[g_current_image];
         }
     }
-    fv_trim_cache();
+    FvLoader_Replace(requests, request_count);
+}
 
-    /* Масштаб, заголовок и размер окна — по исходному размеру кадра. */
+/* Битмап кадра из кэша (создаётся при необходимости); NULL — не удалось. */
+static ID2D1Bitmap *fv_ensure_entry_bitmap(SIZE_T index, const WCHAR *reason);
+
+static void fv_apply_actual_size_toggle(HWND window, const DecodedImage *image) {
+    /* 1:1 — относительно исходного кадра; нужное разрешение догрузит отрисовка. */
+    if (fv_float_almost_equal(g_scale, 1.0f)) {
+        FLOAT fitted = fv_calculate_scale(window, image->source_width, image->source_height);
+
+        if (!fv_float_almost_equal(fitted, 1.0f)) {
+            g_scale = fitted;
+        }
+    } else {
+        g_scale = 1.0f;
+    }
+}
+
+static void fv_apply_zoom_step(BOOL increase) {
+    if (increase) {
+        if (g_scale <= 10000.0f) {
+            g_scale *= 2.0f;
+        }
+    } else if (g_scale >= 0.00001f) {
+        g_scale *= 0.5f;
+    }
+}
+
+/*
+ * Показ текущего кадра, который уже есть в кэше: масштаб, заголовок и размер
+ * окна — по исходному размеру кадра; зум и 1:1, нажатые до готовности кадра,
+ * применяются здесь в порядке «1:1, затем зум».
+ */
+static void fv_activate_current(HWND window, BOOL repaint, const WCHAR *source) {
+    DecodedImage *image = &g_cache[g_current_image].image;
+    WINDOWPLACEMENT placement;
+
+    g_current_activated = TRUE;
     g_scale = fv_calculate_scale(window, image->source_width, image->source_height);
+    if (g_deferred_actual_size) {
+        fv_apply_actual_size_toggle(window, image);
+    }
+    while (g_deferred_zoom_steps > 0) {
+        fv_apply_zoom_step(TRUE);
+        --g_deferred_zoom_steps;
+    }
+    while (g_deferred_zoom_steps < 0) {
+        fv_apply_zoom_step(FALSE);
+        ++g_deferred_zoom_steps;
+    }
+    g_deferred_actual_size = FALSE;
     fv_update_window_title(window);
+    if (FV_TRACE_ENABLED() && g_trace_frame_pending) {
+        ULONGLONG ready_us = fv_trace_us_since(g_trace_frame_started);
+
+        FvTrace_Printf(
+            L"frame-ready index=%I64u since-request-ms=" FV_MS L" source=%s",
+            (ULONGLONG)g_current_image,
+            FV_MS_ARGS(ready_us),
+            source);
+    }
 
     placement.length = sizeof(placement);
     if (GetWindowPlacement(window, &placement) && placement.showCmd != SW_MAXIMIZE) {
@@ -1565,6 +1909,245 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     if (repaint) {
         InvalidateRect(window, NULL, FALSE);
     }
+}
+
+/*
+ * Переход к кадру g_current_image. Кадр в кэше показывается сразу. Иначе при
+ * фоновой загрузке индекс и заголовок обновляются немедленно, кадр ставится
+ * первым в очередь, а до его готовности на экране остаётся прежний кадр (без
+ * серого фона и без перерисовки); показ — в fv_handle_loaded. Без рабочего
+ * потока (первый кадр при запуске, сбой потока) — синхронный декод.
+ */
+static void fv_set_current_image(HWND window, BOOL repaint) {
+    DecodedImage *image;
+
+    if (g_cache == NULL || g_current_image >= g_files.count) {
+        return;
+    }
+
+    g_has_image_shift = FALSE;
+    g_image_shift.x = 0;
+    g_image_shift.y = 0;
+    g_upgrade_failed_image = ~(SIZE_T)0;
+    g_current_activated = FALSE;
+    g_deferred_zoom_steps = 0;
+    g_deferred_actual_size = FALSE;
+    /* Явный переход к кадру — новая попытка, даже если фоновая не удалась. */
+    g_cache[g_current_image].load_failed = FALSE;
+    image = &g_cache[g_current_image].image;
+    if (FV_TRACE_ENABLED()) {
+        g_trace_frame_started = FvTrace_Now();
+        g_trace_frame_pending = TRUE;
+        FvTrace_Printf(
+            L"frame-request index=%I64u cached=%d bitmap=%d",
+            (ULONGLONG)g_current_image,
+            DecodedImage_IsValid(image) ? 1 : 0,
+            g_cache[g_current_image].bitmap != NULL ? 1 : 0);
+    }
+    if (!DecodedImage_IsValid(image)) {
+        UINT box_width;
+        UINT box_height;
+
+        if (fv_async_available()) {
+            fv_update_window_title(window);
+            fv_schedule_loads(window);
+            if (FV_TRACE_ENABLED()) {
+                FvTrace_Printf(
+                    L"frame-pending index=%I64u showing=%s",
+                    (ULONGLONG)g_current_image,
+                    g_shown_bitmap != NULL ? L"previous" : L"none");
+            }
+            return;
+        }
+
+        fv_decode_box(window, &box_width, &box_height);
+        if (FAILED(fv_decode_image(g_current_image, box_width, box_height, L"current")) ||
+            !DecodedImage_IsValid(image)) {
+            MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
+            if (repaint) {
+                InvalidateRect(window, NULL, FALSE);
+            }
+            return;
+        }
+        fv_trim_cache();
+        fv_activate_current(window, repaint, L"sync");
+    } else {
+        fv_trim_cache();
+        fv_activate_current(window, repaint, L"cache");
+    }
+    fv_schedule_loads(window);
+}
+
+/* Результат одного задания рабочего потока (UI-поток). */
+static void fv_apply_loaded_job(
+    FvLoadJob *job,
+    BOOL *current_ready,
+    BOOL *current_upgraded,
+    BOOL *current_failed,
+    BOOL *accepted,
+    SIZE_T *prefetched,
+    SIZE_T *prefetched_count,
+    SIZE_T prefetched_capacity) {
+    const DecodedImage *cached = NULL;
+    BOOL succeeded = SUCCEEDED(job->result) && !job->cancelled &&
+        DecodedImage_IsValid(&job->image);
+    int disposition;
+
+    if (g_cache != NULL && job->index < g_files.count && job->generation == g_generation) {
+        cached = &g_cache[job->index].image;
+    }
+    disposition = FvPlan_ResultDisposition(
+        job->generation,
+        g_generation,
+        job->index,
+        g_cache != NULL ? g_files.count : 0,
+        succeeded,
+        cached != NULL && DecodedImage_IsValid(cached) ? cached->width : 0U,
+        cached != NULL && DecodedImage_IsValid(cached) ? cached->height : 0U,
+        succeeded ? job->image.width : 0U,
+        succeeded ? job->image.height : 0U,
+        g_max_bitmap_size);
+    if (FV_TRACE_ENABLED()) {
+        static const WCHAR *const actions[] = {L"accept", L"stale", L"redundant", L"failed"};
+
+        FvTrace_Printf(
+            L"job-result index=%I64u reason=%s gen=%I64u action=%s cancelled=%d current=%I64u",
+            (ULONGLONG)job->index,
+            FvLoader_ReasonName(job->reason),
+            job->generation,
+            disposition >= 0 && disposition <= 3 ? actions[disposition] : L"?",
+            job->cancelled ? 1 : 0,
+            (ULONGLONG)g_current_image);
+    }
+
+    if (disposition == FV_PLAN_RESULT_ACCEPT) {
+        FvCacheEntry *entry = &g_cache[job->index];
+        BOOL was_valid = DecodedImage_IsValid(&entry->image);
+
+        fv_free_cache_entry(entry);
+        /* Пиксели переходят в кэш: задание их больше не освобождает. */
+        entry->image = job->image;
+        ZeroMemory(&job->image, sizeof(job->image));
+        entry->load_failed = FALSE;
+        if (job->reason != FV_PLAN_REASON_UPGRADE) {
+            /* Пиксели и такой же D2D-битмап — как в бюджете кэша. */
+            entry->known_bytes = (ULONGLONG)entry->image.pixels_size * 2ULL;
+            entry->known_box_width = job->box_width;
+            entry->known_box_height = job->box_height;
+        }
+        *accepted = TRUE;
+        if (job->index == g_current_image) {
+            if (!g_current_activated) {
+                *current_ready = TRUE;
+            } else if (was_valid) {
+                *current_upgraded = TRUE;
+            }
+        } else {
+            if (*prefetched_count < prefetched_capacity) {
+                prefetched[(*prefetched_count)++] = job->index;
+            }
+            if (g_render_target != NULL) {
+                /* Соседний кадр — сразу в GPU, пока UI свободен: показ без загрузки. */
+                fv_ensure_entry_bitmap(job->index, FvLoader_ReasonName(job->reason));
+            }
+        }
+    } else if (disposition == FV_PLAN_RESULT_REDUNDANT &&
+        job->reason == FV_PLAN_REASON_UPGRADE &&
+        job->index == g_current_image) {
+        /*
+         * Передекод не дал кадра крупнее: повторять его на каждой
+         * перерисовке бессмысленно (как и неудачу) — до смены кадра.
+         */
+        g_upgrade_failed_image = job->index;
+    } else if (disposition == FV_PLAN_RESULT_FAILED && !job->cancelled) {
+        if (job->reason == FV_PLAN_REASON_UPGRADE) {
+            if (job->index == g_current_image) {
+                g_upgrade_failed_image = job->index;
+            }
+        } else {
+            g_cache[job->index].load_failed = TRUE;
+            if (job->index == g_current_image && !g_current_activated) {
+                *current_failed = TRUE;
+            }
+        }
+    }
+}
+
+/* WM_FV_LOADED: забирает готовые задания, показывает текущий кадр, планирует дальше. */
+static void fv_handle_loaded(HWND window) {
+    FvLoadJob *job = FvLoader_TakeCompleted();
+    BOOL current_ready = FALSE;
+    BOOL current_upgraded = FALSE;
+    BOOL current_failed = FALSE;
+    BOOL accepted = FALSE;
+    SIZE_T prefetched[FV_LOADER_MAX_QUEUE];
+    SIZE_T prefetched_count = 0;
+    SIZE_T index;
+
+    while (job != NULL) {
+        FvLoadJob *next = job->next;
+
+        fv_apply_loaded_job(
+            job,
+            &current_ready,
+            &current_upgraded,
+            &current_failed,
+            &accepted,
+            prefetched,
+            &prefetched_count,
+            sizeof(prefetched) / sizeof(prefetched[0]));
+        FvLoader_FreeJob(job);
+        job = next;
+    }
+    if (accepted) {
+        fv_trim_cache();
+    }
+    /*
+     * Сосед, вытесненный тем же trim сразу после декода, при тех же условиях
+     * заказывался бы снова и снова (бесконечный цикл чтения и декода): помечаем его.
+     * Основная защита — фактический размер в FvPlan_FitPrefetch; пометка
+     * страхует от расхождения оценки и бюджета.
+     */
+    if (prefetched_count != 0 && g_cache != NULL) {
+        UINT box_width;
+        UINT box_height;
+        FvPlanPrefetchContext context;
+
+        fv_decode_box(window, &box_width, &box_height);
+        context = fv_prefetch_context(box_width, box_height);
+        fv_refresh_prefetch_suppression(&context);
+        for (index = 0; index < prefetched_count; ++index) {
+            FvCacheEntry *entry = &g_cache[prefetched[index]];
+
+            if (DecodedImage_IsValid(&entry->image)) {
+                continue;
+            }
+            entry->prefetch_suppressed = TRUE;
+            g_prefetch_suppress_context = context;
+            g_prefetch_suppress_any = TRUE;
+            if (FV_TRACE_ENABLED()) {
+                FvTrace_Printf(
+                    L"prefetch-suppressed index=%I64u known_bytes=%I64u current=%I64u",
+                    (ULONGLONG)prefetched[index],
+                    entry->known_bytes,
+                    (ULONGLONG)g_current_image);
+            }
+        }
+    }
+    if (current_ready &&
+        g_cache != NULL &&
+        g_current_image < g_files.count &&
+        DecodedImage_IsValid(&g_cache[g_current_image].image)) {
+        fv_activate_current(window, TRUE, L"loader");
+    } else if (current_upgraded) {
+        InvalidateRect(window, NULL, FALSE);
+    } else if (current_failed) {
+        /* Как при синхронном декоде: вместо кадра — фон и сообщение (прежний кадр не выдаём за текущий). */
+        fv_release_shown_bitmap();
+        InvalidateRect(window, NULL, FALSE);
+        MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
+    }
+    fv_schedule_loads(window);
 }
 
 static void fv_release_render_target(void) {
@@ -1662,6 +2245,38 @@ static ID2D1Bitmap *fv_create_d2d_bitmap(const DecodedImage *image) {
     return bitmap;
 }
 
+static ID2D1Bitmap *fv_ensure_entry_bitmap(SIZE_T index, const WCHAR *reason) {
+    FvCacheEntry *entry;
+    ULONGLONG trace_started;
+
+    if (g_render_target == NULL || g_cache == NULL || index >= g_files.count) {
+        return NULL;
+    }
+    entry = &g_cache[index];
+    if (entry->bitmap != NULL || !DecodedImage_IsValid(&entry->image)) {
+        return entry->bitmap;
+    }
+    trace_started = FV_TRACE_NOW();
+    entry->bitmap = fv_create_d2d_bitmap(&entry->image);
+    entry->bitmap_bytes = entry->bitmap != NULL
+        ? (SIZE_T)entry->image.width * (SIZE_T)entry->image.height * 4U
+        : 0;
+    if (FV_TRACE_ENABLED()) {
+        ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+
+        FvTrace_Printf(
+            L"create-bitmap index=%I64u ms=" FV_MS L" ok=%d width=%u height=%u bytes=%I64u reason=%s",
+            (ULONGLONG)index,
+            FV_MS_ARGS(elapsed_us),
+            entry->bitmap != NULL ? 1 : 0,
+            entry->image.width,
+            entry->image.height,
+            (ULONGLONG)entry->bitmap_bytes,
+            reason);
+    }
+    return entry->bitmap;
+}
+
 static void fv_draw_image(HWND window) {
     const DecodedImage *image = NULL;
     ID2D1Bitmap *bitmap = NULL;
@@ -1678,33 +2293,15 @@ static void fv_draw_image(HWND window) {
         return;
     }
 
-    fv_ensure_current_resolution();
+    fv_ensure_current_resolution(window);
     if (g_cache != NULL && g_current_image < g_files.count &&
-        DecodedImage_IsValid(&g_cache[g_current_image].image)) {
+        DecodedImage_IsValid(&g_cache[g_current_image].image) &&
+        (g_current_activated || !g_loader_active)) {
         FvCacheEntry *entry = &g_cache[g_current_image];
 
         image = &entry->image;
         if (entry->bitmap == NULL) {
-            ULONGLONG trace_started;
-
-            trace_started = FV_TRACE_NOW();
-            entry->bitmap = fv_create_d2d_bitmap(image);
-            entry->bitmap_bytes = entry->bitmap != NULL
-                ? (SIZE_T)image->width * (SIZE_T)image->height * 4U
-                : 0;
-            if (FV_TRACE_ENABLED()) {
-                ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
-
-                FvTrace_Printf(
-                    L"create-bitmap index=%I64u ms=" FV_MS L" ok=%d width=%u height=%u bytes=%I64u",
-                    (ULONGLONG)g_current_image,
-                    FV_MS_ARGS(elapsed_us),
-                    entry->bitmap != NULL ? 1 : 0,
-                    image->width,
-                    image->height,
-                    (ULONGLONG)entry->bitmap_bytes);
-            }
-            if (entry->bitmap != NULL) {
+            if (fv_ensure_entry_bitmap(g_current_image, L"draw") != NULL) {
                 fv_trim_cache();
             }
         } else if (FV_TRACE_ENABLED() && g_trace_frame_pending) {
@@ -1765,7 +2362,27 @@ static void fv_draw_image(HWND window) {
                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                 NULL);
             image_drawn = TRUE;
+            /* Снимок показанного кадра: его рисуем, пока грузится следующий. */
+            if (g_shown_bitmap != bitmap) {
+                fv_release_shown_bitmap();
+                FV_UNKNOWN_VT(bitmap)->AddRef(bitmap);
+                g_shown_bitmap = bitmap;
+            }
+            g_shown_rect = destination;
         }
+    } else if (g_shown_bitmap != NULL) {
+        /*
+         * Текущий кадр ещё декодируется: прежний кадр остаётся на месте
+         * (перерисовка окна при перекрытии/ресайзе не даёт серого «мигания»).
+         * В трассе это не frame-shown — это не текущий кадр.
+         */
+        FV_TARGET_VT(g_render_target)->DrawBitmap(
+            g_render_target,
+            g_shown_bitmap,
+            &g_shown_rect,
+            1.0f,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            NULL);
     }
 
     trace_started = FV_TRACE_NOW();
@@ -1803,6 +2420,7 @@ static void fv_previous_image(HWND window) {
         return;
     }
     --g_current_image;
+    g_nav_direction = -1;
     fv_set_current_image(window, TRUE);
 }
 
@@ -1811,11 +2429,22 @@ static void fv_next_image(HWND window) {
         return;
     }
     ++g_current_image;
+    g_nav_direction = 1;
     fv_set_current_image(window, TRUE);
+}
+
+/* Кадр ещё грузится: зум и 1:1 применятся при его показе (fv_activate_current). */
+static BOOL fv_current_pending(void) {
+    return g_loader_active && !g_current_activated &&
+        g_cache != NULL && g_current_image < g_files.count;
 }
 
 static void fv_scale_image(HWND window, BOOL increase) {
     if (g_files.count == 0) {
+        return;
+    }
+    if (fv_current_pending()) {
+        g_deferred_zoom_steps += increase ? 1 : -1;
         return;
     }
     if (increase) {
@@ -1835,7 +2464,12 @@ static void fv_scale_image(HWND window, BOOL increase) {
 
 static void fv_toggle_actual_size(HWND window) {
     const DecodedImage *image;
+    FLOAT previous_scale = g_scale;
 
+    if (fv_current_pending()) {
+        g_deferred_actual_size = !g_deferred_actual_size;
+        return;
+    }
     if (g_cache == NULL || g_current_image >= g_files.count ||
         !DecodedImage_IsValid(&g_cache[g_current_image].image)) {
         return;
@@ -1843,14 +2477,9 @@ static void fv_toggle_actual_size(HWND window) {
     image = &g_cache[g_current_image].image;
 
     /* 1:1 — относительно исходного кадра; нужное разрешение догрузит отрисовка. */
-    if (fv_float_almost_equal(g_scale, 1.0f)) {
-        FLOAT fitted = fv_calculate_scale(window, image->source_width, image->source_height);
-        if (fv_float_almost_equal(fitted, 1.0f)) {
-            return;
-        }
-        g_scale = fitted;
-    } else {
-        g_scale = 1.0f;
+    fv_apply_actual_size_toggle(window, image);
+    if (fv_float_almost_equal(previous_scale, g_scale)) {
+        return;
     }
 
     fv_update_window_title(window);
@@ -1974,6 +2603,8 @@ static void fv_switch_zip_file(HWND window, int direction) {
     }
 
     if (fv_build_zip_file_list(next_archive, NULL, TRUE)) {
+        /* Новый архив открывается с первого кадра: листать будут вперёд. */
+        g_nav_direction = 1;
         fv_set_current_image(window, TRUE);
     }
     fv_heap_free(next_archive);
@@ -2069,6 +2700,7 @@ static LRESULT CALLBACK FvWindowProc(
         case VK_HOME:
             if (!g_block_navigation && g_files.count != 0) {
                 g_current_image = 0;
+                g_nav_direction = 1;
                 fv_set_current_image(window, TRUE);
             }
             return 0;
@@ -2077,6 +2709,7 @@ static LRESULT CALLBACK FvWindowProc(
         case VK_END:
             if (!g_block_navigation && g_files.count != 0) {
                 g_current_image = g_files.count - 1;
+                g_nav_direction = -1;
                 fv_set_current_image(window, TRUE);
             }
             return 0;
@@ -2197,6 +2830,10 @@ static LRESULT CALLBACK FvWindowProc(
         }
         return 0;
 
+    case WM_FV_LOADED:
+        fv_handle_loaded(window);
+        return 0;
+
     case WM_ERASEBKGND:
         return 1;
 
@@ -2237,6 +2874,53 @@ static BOOL fv_choose_root(WCHAR **root) {
     return candidate != NULL;
 }
 
+/*
+ * Диагностическая настройка окна prefetch для замеров:
+ * FOLDERVIEW_PREFETCH=<вперёд>,<назад> (каждое 0..FV_PLAN_PREFETCH_MAX).
+ * Без переменной — FV_PLAN_PREFETCH_AHEAD/BEHIND.
+ */
+static void fv_read_prefetch_setting(void) {
+    WCHAR value[32];
+    DWORD length = GetEnvironmentVariableW(
+        L"FOLDERVIEW_PREFETCH",
+        value,
+        (DWORD)(sizeof(value) / sizeof(value[0])));
+    SIZE_T numbers[2] = {0, 0};
+    SIZE_T parsed = 0;
+    BOOL digits = FALSE;
+    DWORD index;
+
+    if (length != 0 && length < (DWORD)(sizeof(value) / sizeof(value[0]))) {
+        for (index = 0; index <= length && parsed < 2; ++index) {
+            WCHAR character = index < length ? value[index] : L',';
+
+            if (character >= L'0' && character <= L'9') {
+                numbers[parsed] = numbers[parsed] * 10U + (SIZE_T)(character - L'0');
+                if (numbers[parsed] > FV_PLAN_PREFETCH_MAX) {
+                    numbers[parsed] = FV_PLAN_PREFETCH_MAX;
+                }
+                digits = TRUE;
+            } else if (character == L',' && digits) {
+                ++parsed;
+                digits = FALSE;
+            } else {
+                parsed = 0;
+                break;
+            }
+        }
+        if (parsed == 2) {
+            g_prefetch_ahead = numbers[0];
+            g_prefetch_behind = numbers[1];
+        }
+    }
+    if (FV_TRACE_ENABLED()) {
+        FvTrace_Printf(
+            L"prefetch ahead=%I64u behind=%I64u",
+            (ULONGLONG)g_prefetch_ahead,
+            (ULONGLONG)g_prefetch_behind);
+    }
+}
+
 static int fv_application_main(void) {
     HRESULT status;
     BOOL ole_initialized = FALSE;
@@ -2272,6 +2956,7 @@ static int fv_application_main(void) {
         }
         g_cache_budget = FvPlan_CacheBudget(physical);
         g_bitmap_budget = FvPlan_BitmapBudget(g_cache_budget);
+        fv_read_prefetch_setting();
         if (FV_TRACE_ENABLED()) {
             FvTrace_Printf(
                 L"cache-budget bytes=%I64u bitmap_bytes=%I64u physical=%I64u radius=%I64u",
@@ -2380,7 +3065,15 @@ static int fv_application_main(void) {
     }
 
     ShowWindow(window, SW_MAXIMIZE);
+    /* Первый кадр — синхронно (окно не показывает пустой фон), дальше — фон. */
     fv_set_current_image(window, FALSE);
+    g_loader_active = FvLoader_Start(window, WM_FV_LOADED);
+    if (g_loader_active) {
+        fv_refresh_loader_archive();
+        fv_schedule_loads(window);
+    } else if (FV_TRACE_ENABLED()) {
+        FvTrace_Printf(L"loader-start-failed error=%lu", GetLastError());
+    }
     UpdateWindow(window);
 
     for (;;) {
@@ -2400,6 +3093,16 @@ static int fv_application_main(void) {
     }
 
 cleanup:
+    /*
+     * Рабочий поток — до окна и кэша: он не трогает их, но его уведомления
+     * адресованы окну, а незабранные результаты освобождает FvLoader_Stop.
+     */
+    if (g_loader_active) {
+        FvLoader_Stop();
+        g_loader_active = FALSE;
+    }
+    FvLoaderArchive_Release(g_loader_archive);
+    g_loader_archive = NULL;
     if (window != NULL && IsWindow(window)) {
         DestroyWindow(window);
     }

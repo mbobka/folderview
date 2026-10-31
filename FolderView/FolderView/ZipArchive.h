@@ -72,7 +72,7 @@ BOOL ZipArchive_Open(ZipArchive* archive, LPCWSTR path);
 /*
  * Как ZipArchive_Open, но с явными флагами CreateFileW (FILE_FLAG_*),
  * которые добавляются к FILE_ATTRIBUTE_NORMAL. ZipArchive_DefaultOpenFlags —
- * флаги, которые использует ZipArchive_Open. Нужен бенчмарку для A/B флагов.
+ * флаги, которые использует ZipArchive_Open. Нужен для A/B-замеров флагов.
  */
 BOOL ZipArchive_OpenEx(ZipArchive* archive, LPCWSTR path, DWORD file_flags);
 DWORD ZipArchive_DefaultOpenFlags(void);
@@ -106,6 +106,41 @@ BOOL ZipArchive_ExtractEntry(
     BYTE** data,
     SIZE_T* size);
 void ZipArchive_FreeBuffer(void* data);
+
+/*
+ * Чтение записей из другого потока (фоновый декод вьювера). Поток
+ * получает собственный дубликат хэндла открытого архива
+ * (ZipArchive_DuplicateFile): он ссылается на тот же file object, поэтому
+ * не стоит сетевого открытия, живёт независимо от ZipArchive_Close и сохраняет
+ * гарантию FILE_SHARE_READ (файл не меняется, пока открыт хотя бы один
+ * хэндл). Закрывается вызывающим (CloseHandle).
+ */
+BOOL ZipArchive_DuplicateFile(const ZipArchive* archive, HANDLE* file);
+
+/* Переиспользуемый буфер входа deflate и счётчики I/O одного потока. */
+typedef struct ZipReadScratch {
+    BYTE* input_buffer;
+    SIZE_T input_capacity;
+    ZipIoStats io;
+} ZipReadScratch;
+
+void ZipReadScratch_Init(ZipReadScratch* scratch);
+void ZipReadScratch_Free(ZipReadScratch* scratch);
+
+/*
+ * Как ZipArchive_ExtractEntry, но по хэндлу file размера file_size и копии
+ * записи (имя не используется; entry->name может быть NULL). Принадлежность
+ * записи архиву не проверяется: границы данных сверяются с file_size при
+ * разборе local header. Буфер освобождается через ZipArchive_FreeBuffer.
+ */
+BOOL ZipArchive_ExtractEntryFromFile(
+    HANDLE file,
+    ULONGLONG file_size,
+    const ZipEntry* entry,
+    ULONGLONG max_output_bytes,
+    ZipReadScratch* scratch,
+    BYTE** data,
+    SIZE_T* size);
 
 /* Счётчики I/O с момента открытия и разбивка фаз открытия. */
 void ZipArchive_GetIoStats(const ZipArchive* archive, ZipIoStats* stats);

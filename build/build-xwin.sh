@@ -111,6 +111,7 @@ CL_FLAGS=(
 SOURCES=(
     FolderView.c
     WicDecoder.c
+    ViewerLoader.c
     ViewerPlan.c
     ZipArchive.c
     ZipFormat.c

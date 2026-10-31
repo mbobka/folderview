@@ -30,7 +30,9 @@ typedef enum ImageDecoderInterpolation {
     IMAGE_DECODER_INTERPOLATION_HIGH_QUALITY_CUBIC = 4
 } ImageDecoderInterpolation;
 
-// Режим по умолчанию (вьювер): выбран замером, см. UPSTREAM.md.
+// Режим по умолчанию (вьювер) выбран замером: Fant усредняет по площади без
+// алиасинга; на 3334x5000 -> 960x1440 медиана декода 27,7 мс против 24,0 у
+// Linear, 32,8 у HighQualityCubic и 51,5 у Cubic.
 #define IMAGE_DECODER_DEFAULT_INTERPOLATION IMAGE_DECODER_INTERPOLATION_FANT
 
 // Параметры декодирования. Нулевая структура — полное разрешение.
@@ -49,10 +51,10 @@ typedef struct ImageDecodeOptions {
     UINT dct_slack_percent;
 } ImageDecodeOptions;
 
-// Допуск DCT-размера по умолчанию (вьювер): см. UPSTREAM.md.
+// Допуск DCT-размера по умолчанию (вьювер).
 #define IMAGE_DECODER_DEFAULT_DCT_SLACK_PERCENT 25U
 
-// Подробности одного декодирования (для трассы и бенчмарка). Время — в
+// Подробности одного декодирования (для трассы). Время — в
 // тиках QueryPerformanceCounter.
 typedef struct ImageDecodeStats {
     UINT source_width;
@@ -71,8 +73,22 @@ typedef struct ImageDecodeStats {
     ULONGLONG pixels_ticks;
 } ImageDecodeStats;
 
-// Инициализирует COM на текущем потоке и создаёт WIC-фабрику.
-// Initialize и Shutdown должны вызываться на одном и том же потоке.
+// Контекст декодирования одного потока: своя инициализация COM и своя
+// WIC-фабрика. Рабочий поток вьювера декодирует через собственный
+// контекст, UI-поток — через общий (ImageDecoder_Initialize).
+typedef struct ImageDecoderContext {
+    // IWICImagingFactory*; void*, чтобы заголовок не тянул wincodec.h.
+    void* factory;
+    BOOL com_owned;
+} ImageDecoderContext;
+
+// Инициализирует COM на текущем потоке (coinit — флаги CoInitializeEx) и
+// создаёт WIC-фабрику. Create и Destroy вызываются на одном и том же потоке.
+HRESULT ImageDecoderContext_Create(ImageDecoderContext* context, DWORD coinit);
+void ImageDecoderContext_Destroy(ImageDecoderContext* context);
+
+// Инициализирует COM на текущем потоке и создаёт общую WIC-фабрику для
+// функций без контекста. Initialize и Shutdown вызываются на одном потоке.
 HRESULT ImageDecoder_Initialize(void);
 
 // Освобождает WIC-фабрику и балансирует инициализацию COM.
@@ -99,6 +115,22 @@ HRESULT ImageDecoder_DecodeFileEx(
     ImageDecodeStats* stats);
 
 HRESULT ImageDecoder_DecodeMemoryEx(
+    const BYTE* data,
+    SIZE_T data_size,
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats);
+
+// То же через контекст потока (ImageDecoderContext_Create на этом потоке).
+HRESULT ImageDecoder_DecodeFileWith(
+    const ImageDecoderContext* context,
+    LPCWSTR path,
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats);
+
+HRESULT ImageDecoder_DecodeMemoryWith(
+    const ImageDecoderContext* context,
     const BYTE* data,
     SIZE_T data_size,
     const ImageDecodeOptions* options,

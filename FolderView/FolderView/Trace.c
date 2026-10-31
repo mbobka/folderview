@@ -52,12 +52,17 @@ void FvTrace_Initialize(void) {
     g_fv_trace_enabled = TRUE;
 }
 
+static SRWLOCK g_fv_trace_lock = SRWLOCK_INIT;
+
 void FvTrace_Shutdown(void) {
+    /* Под блокировкой: рабочий поток мог не завершиться (выход по таймауту). */
+    AcquireSRWLockExclusive(&g_fv_trace_lock);
     if (g_fv_trace_file != INVALID_HANDLE_VALUE) {
         CloseHandle(g_fv_trace_file);
         g_fv_trace_file = INVALID_HANDLE_VALUE;
     }
     g_fv_trace_enabled = FALSE;
+    ReleaseSRWLockExclusive(&g_fv_trace_lock);
 }
 
 ULONGLONG FvTrace_Now(void) {
@@ -93,7 +98,8 @@ const WCHAR* FvTrace_Tail(const WCHAR* text, int max_chars) {
 
 /*
  * Буферы статические: кадр стека больше 4 КиБ потребовал бы __chkstk из CRT.
- * Трасса пишется только из UI-потока (во вьювере) или основного потока бенча.
+ * Трассу пишут UI-поток и рабочий поток декода, поэтому форматирование
+ * и запись строки идут под SRW-блокировкой (статическая инициализация).
  */
 static WCHAR g_fv_trace_line[FV_TRACE_PREFIX_CHARS + FV_TRACE_LINE_CHARS + 2];
 static char g_fv_trace_utf8[FV_TRACE_UTF8_BYTES];
@@ -112,6 +118,11 @@ void FvTrace_Printf(const WCHAR* format, ...) {
         return;
     }
 
+    AcquireSRWLockExclusive(&g_fv_trace_lock);
+    if (g_fv_trace_file == INVALID_HANDLE_VALUE) {
+        ReleaseSRWLockExclusive(&g_fv_trace_lock);
+        return;
+    }
     elapsed_us = FvTrace_TicksToMicroseconds(
         FvTrace_Now() - (ULONGLONG)g_fv_trace_start.QuadPart);
     prefix = wsprintfW(
@@ -120,6 +131,7 @@ void FvTrace_Printf(const WCHAR* format, ...) {
         elapsed_us / 1000ULL,
         elapsed_us % 1000ULL);
     if (prefix < 0) {
+        ReleaseSRWLockExclusive(&g_fv_trace_lock);
         return;
     }
 
@@ -127,6 +139,7 @@ void FvTrace_Printf(const WCHAR* format, ...) {
     body = wvsprintfW(line + prefix, format, arguments);
     va_end(arguments);
     if (body < 0) {
+        ReleaseSRWLockExclusive(&g_fv_trace_lock);
         return;
     }
     line[prefix + body] = L'\n';
@@ -143,4 +156,5 @@ void FvTrace_Printf(const WCHAR* format, ...) {
     if (bytes > 0) {
         WriteFile(g_fv_trace_file, utf8, (DWORD)bytes, &written, NULL);
     }
+    ReleaseSRWLockExclusive(&g_fv_trace_lock);
 }

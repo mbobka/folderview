@@ -40,7 +40,9 @@ fview <path>
 
 ## Diagnostics
 
-Set `FOLDERVIEW_TRACE` to a file path to append a timing trace (UTF-8, one event per line, QPC time in milliseconds since start): ZIP open phases with `ReadFile` counts, entry reads, decoding, bitmap creation, `EndDraw`, and the moment each frame is shown. Without the variable tracing costs a single flag check.
+Set `FOLDERVIEW_TRACE` to a file path to append a timing trace (UTF-8, one event per line, QPC time in milliseconds since start): ZIP open phases with `ReadFile` counts, entry reads, decoding, bitmap creation, `EndDraw`, background loader jobs (queue, start, cancel, result), cache evictions, and the moment each frame is ready and shown. Without the variable tracing costs a single flag check.
+
+Images are read and decoded on a background thread, and the viewer prefetches 3 images ahead and 1 behind in the browsing direction within the frame cache budget. `FOLDERVIEW_PREFETCH=<ahead>,<behind>` (each 0–8) overrides the prefetch window for measurements.
 
 ```powershell
 $env:FOLDERVIEW_TRACE = "$env:TEMP\folderview-trace.txt"
