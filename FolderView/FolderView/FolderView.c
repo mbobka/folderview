@@ -15,6 +15,7 @@
 #include <d2d1.h>
 
 #include "ImageDecoder.h"
+#include "Trace.h"
 #include "ZipArchive.h"
 
 /*
@@ -183,6 +184,15 @@ static BOOL g_has_image_shift;
 static POINT g_image_shift;
 static POINTS g_drag_origin;
 static FLOAT g_scale = 1.0f;
+/* Трасса FOLDERVIEW_TRACE: начало текущего перехода и признак первого кадра. */
+static ULONGLONG g_trace_frame_started;
+static BOOL g_trace_frame_pending;
+static BOOL g_trace_first_paint_done;
+
+/* Микросекунды как "мс.ддд" для wsprintfW: формат FV_MS, аргументы FV_MS_ARGS. */
+#define FV_MS L"%I64u.%03I64u"
+#define FV_MS_ARGS(us) (ULONGLONG)(us) / 1000ULL, (ULONGLONG)(us) % 1000ULL
+#define FV_TRACE_PATH_CHARS 240
 
 static LRESULT CALLBACK FvWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 static void fv_set_current_image(HWND window, BOOL repaint);
@@ -845,11 +855,63 @@ static BOOL fv_virtual_path_equal(const WCHAR *left, const WCHAR *right) {
     }
 }
 
+static ULONGLONG fv_trace_us_since(ULONGLONG started) {
+    return FvTrace_TicksToMicroseconds(FvTrace_Now() - started);
+}
+
+static void fv_trace_zip_open(const ZipArchive *archive, ULONGLONG started) {
+    ZipIoStats io;
+    ZipOpenStats open_stats;
+    ULONGLONG total_us = fv_trace_us_since(started);
+    ULONGLONG tail_us;
+    ULONGLONG directory_us;
+
+    ZipArchive_GetIoStats(archive, &io);
+    ZipArchive_GetOpenStats(archive, &open_stats);
+    tail_us = FvTrace_TicksToMicroseconds(open_stats.tail_ticks);
+    directory_us = FvTrace_TicksToMicroseconds(open_stats.directory_ticks);
+    FvTrace_Printf(
+        L"tail-read ms=" FV_MS L" reads=%I64u bytes=%I64u",
+        FV_MS_ARGS(tail_us),
+        open_stats.tail_io.read_calls,
+        open_stats.tail_io.read_bytes);
+    FvTrace_Printf(
+        L"cd-parse ms=" FV_MS L" reads=%I64u bytes=%I64u entries=%I64u",
+        FV_MS_ARGS(directory_us),
+        open_stats.directory_io.read_calls,
+        open_stats.directory_io.read_bytes,
+        (ULONGLONG)ZipArchive_EntryCount(archive));
+    FvTrace_Printf(
+        L"open ms=" FV_MS L" reads=%I64u bytes=%I64u file_size=%I64u path=%s",
+        FV_MS_ARGS(total_us),
+        io.read_calls,
+        io.read_bytes,
+        archive->file_size,
+        FvTrace_Tail(ZipArchive_Path(archive), FV_TRACE_PATH_CHARS));
+}
+
+static BOOL fv_can_reuse_open_zip(const WCHAR *zip_path) {
+    const WCHAR *open_path;
+
+    if (!g_zip_mode || zip_path == NULL || !ZipArchive_IsOpen(&g_zip)) {
+        return FALSE;
+    }
+    open_path = ZipArchive_Path(&g_zip);
+    if (open_path == NULL ||
+        CompareStringOrdinal(open_path, -1, zip_path, -1, TRUE) != CSTR_EQUAL) {
+        return FALSE;
+    }
+    return ZipArchive_IsUnchanged(&g_zip);
+}
+
 static BOOL fv_build_zip_file_list(
     const WCHAR *zip_path,
     const WCHAR *start_entry,
     BOOL require_image) {
     ZipArchive temporary_zip;
+    /* Архив, из которого строится список: новый temporary_zip или уже открытый g_zip. */
+    ZipArchive *archive = &temporary_zip;
+    BOOL reuse_open_zip;
     FvStringList temporary_files;
     const ZipEntry **temporary_zip_entries = NULL;
     DecodedImage *temporary_cache = NULL;
@@ -858,15 +920,44 @@ static BOOL fv_build_zip_file_list(
     SIZE_T byte_count;
     SIZE_T index;
     BOOL success = FALSE;
+    ULONGLONG trace_started;
 
     ZipArchive_Init(&temporary_zip);
     fv_string_list_init(&temporary_files);
-    if (!ZipArchive_Open(&temporary_zip, zip_path)) {
+    trace_started = FV_TRACE_NOW();
+    /*
+     * Если путь совпадает с уже открытым архивом и файл не изменился,
+     * central directory и записи переиспользуются без повторного открытия
+     * и разбора.
+     */
+    reuse_open_zip = fv_can_reuse_open_zip(zip_path);
+    if (reuse_open_zip) {
+        archive = &g_zip;
+        if (FV_TRACE_ENABLED()) {
+            ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+
+            FvTrace_Printf(
+                L"archive-reuse ms=" FV_MS L" entries=%I64u path=%s",
+                FV_MS_ARGS(elapsed_us),
+                (ULONGLONG)ZipArchive_EntryCount(archive),
+                FvTrace_Tail(ZipArchive_Path(archive), FV_TRACE_PATH_CHARS));
+        }
+    } else if (!ZipArchive_Open(&temporary_zip, zip_path)) {
+        if (FV_TRACE_ENABLED()) {
+            DWORD error = GetLastError();
+
+            FvTrace_Printf(
+                L"open-failed error=%lu path=%s",
+                error,
+                FvTrace_Tail(zip_path, FV_TRACE_PATH_CHARS));
+        }
         MessageBoxW(NULL, L"Не удалось открыть ZIP-архив", L"FolderView", MB_OK | MB_ICONERROR);
         goto cleanup;
+    } else if (FV_TRACE_ENABLED()) {
+        fv_trace_zip_open(&temporary_zip, trace_started);
     }
 
-    entry_count = ZipArchive_EntryCount(&temporary_zip);
+    entry_count = ZipArchive_EntryCount(archive);
     if (entry_count != 0) {
         if (!fv_size_multiply(entry_count, sizeof(*temporary_zip_entries), &byte_count)) {
             goto cleanup;
@@ -879,7 +970,7 @@ static BOOL fv_build_zip_file_list(
     }
 
     for (index = 0; index < entry_count; ++index) {
-        const ZipEntry *entry = ZipArchive_EntryAt(&temporary_zip, index);
+        const ZipEntry *entry = ZipArchive_EntryAt(archive, index);
         const WCHAR *name = entry != NULL ? ZipEntry_Name(entry) : NULL;
 
         if (name != NULL && fv_is_supported_image(name)) {
@@ -909,11 +1000,17 @@ static BOOL fv_build_zip_file_list(
         goto cleanup;
     }
 
-    /* Старое состояние уничтожается только после полной подготовки нового. */
+    /*
+     * Старое состояние уничтожается только после полной подготовки нового.
+     * При переиспользовании g_zip остаётся открытым: записи, на которые
+     * ссылается новый список, принадлежат ему.
+     */
     fv_clear_files_and_cache();
-    ZipArchive_Close(&g_zip);
-    g_zip = temporary_zip;
-    ZipArchive_Init(&temporary_zip);
+    if (!reuse_open_zip) {
+        ZipArchive_Close(&g_zip);
+        g_zip = temporary_zip;
+        ZipArchive_Init(&temporary_zip);
+    }
     g_files = temporary_files;
     fv_string_list_init(&temporary_files);
     g_zip_entries = temporary_zip_entries;
@@ -1076,28 +1173,72 @@ static void fv_trim_cache(void) {
 static HRESULT fv_decode_current_image(void) {
     HRESULT result;
 
+    ULONGLONG trace_started;
+
     if (g_zip_mode) {
         BYTE *data = NULL;
         SIZE_T size = 0;
+        ZipIoStats io_before;
+        BOOL extracted;
 
         if (g_zip_entries == NULL ||
-            g_current_image >= g_files.count ||
-            !ZipArchive_ExtractEntry(
-                &g_zip,
-                g_zip_entries[g_current_image],
-                FV_MAX_ZIP_IMAGE_BYTES,
-                &data,
-                &size)) {
+            g_current_image >= g_files.count) {
             return E_FAIL;
         }
+        if (FV_TRACE_ENABLED()) {
+            ZipArchive_GetIoStats(&g_zip, &io_before);
+        }
+        trace_started = FV_TRACE_NOW();
+        extracted = ZipArchive_ExtractEntry(
+            &g_zip,
+            g_zip_entries[g_current_image],
+            FV_MAX_ZIP_IMAGE_BYTES,
+            &data,
+            &size);
+        if (FV_TRACE_ENABLED()) {
+            DWORD error = extracted ? ERROR_SUCCESS : GetLastError();
+            ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+            ZipIoStats io_after;
+
+            ZipArchive_GetIoStats(&g_zip, &io_after);
+            FvTrace_Printf(
+                L"entry-read index=%I64u ms=" FV_MS
+                L" bytes=%I64u compressed=%I64u method=%u reads=%I64u read_bytes=%I64u error=%lu",
+                (ULONGLONG)g_current_image,
+                FV_MS_ARGS(elapsed_us),
+                (ULONGLONG)size,
+                g_zip_entries[g_current_image]->compressed_size,
+                (UINT)g_zip_entries[g_current_image]->compression_method,
+                io_after.read_calls - io_before.read_calls,
+                io_after.read_bytes - io_before.read_bytes,
+                error);
+        }
+        if (!extracted) {
+            return E_FAIL;
+        }
+        trace_started = FV_TRACE_NOW();
         result = ImageDecoder_DecodeMemory(data, size, &g_cache[g_current_image]);
         ZipArchive_FreeBuffer(data);
-        return result;
+    } else {
+        trace_started = FV_TRACE_NOW();
+        result = ImageDecoder_DecodeFile(
+            g_files.items[g_current_image],
+            &g_cache[g_current_image]);
     }
 
-    return ImageDecoder_DecodeFile(
-        g_files.items[g_current_image],
-        &g_cache[g_current_image]);
+    if (FV_TRACE_ENABLED()) {
+        ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+        const DecodedImage *image = &g_cache[g_current_image];
+
+        FvTrace_Printf(
+            L"decode index=%I64u ms=" FV_MS L" hr=0x%08lX width=%u height=%u",
+            (ULONGLONG)g_current_image,
+            FV_MS_ARGS(elapsed_us),
+            (DWORD)result,
+            SUCCEEDED(result) ? image->width : 0U,
+            SUCCEEDED(result) ? image->height : 0U);
+    }
+    return result;
 }
 
 static void fv_set_current_image(HWND window, BOOL repaint) {
@@ -1113,6 +1254,14 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     g_image_shift.y = 0;
     fv_release_d2d_bitmap();
     image = &g_cache[g_current_image];
+    if (FV_TRACE_ENABLED()) {
+        g_trace_frame_started = FvTrace_Now();
+        g_trace_frame_pending = TRUE;
+        FvTrace_Printf(
+            L"frame-request index=%I64u cached=%d",
+            (ULONGLONG)g_current_image,
+            DecodedImage_IsValid(image) ? 1 : 0);
+    }
     if (!DecodedImage_IsValid(image)) {
         if (FAILED(fv_decode_current_image()) || !DecodedImage_IsValid(image)) {
             MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
@@ -1246,6 +1395,8 @@ static void fv_draw_image(HWND window) {
     ID2D1Bitmap *bitmap = NULL;
     D2D1_COLOR_F background;
     HRESULT result;
+    BOOL image_drawn = FALSE;
+    ULONGLONG trace_started;
 
     if (FAILED(fv_create_render_target(window))) {
         return;
@@ -1259,8 +1410,22 @@ static void fv_draw_image(HWND window) {
         DecodedImage_IsValid(&g_cache[g_current_image])) {
         image = &g_cache[g_current_image];
         if (g_d2d_bitmap == NULL || g_d2d_bitmap_image != g_current_image) {
+            ULONGLONG trace_started;
+
             fv_release_d2d_bitmap();
+            trace_started = FV_TRACE_NOW();
             g_d2d_bitmap = fv_create_d2d_bitmap(image);
+            if (FV_TRACE_ENABLED()) {
+                ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+
+                FvTrace_Printf(
+                    L"create-bitmap index=%I64u ms=" FV_MS L" ok=%d width=%u height=%u",
+                    (ULONGLONG)g_current_image,
+                    FV_MS_ARGS(elapsed_us),
+                    g_d2d_bitmap != NULL ? 1 : 0,
+                    image->width,
+                    image->height);
+            }
             if (g_d2d_bitmap != NULL) {
                 g_d2d_bitmap_image = g_current_image;
             }
@@ -1310,10 +1475,35 @@ static void fv_draw_image(HWND window) {
                 1.0f,
                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                 NULL);
+            image_drawn = TRUE;
         }
     }
 
+    trace_started = FV_TRACE_NOW();
     result = FV_TARGET_VT(g_render_target)->EndDraw(g_render_target, NULL, NULL);
+    if (FV_TRACE_ENABLED()) {
+        ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
+
+        FvTrace_Printf(
+            L"end-draw index=%I64u ms=" FV_MS L" hr=0x%08lX drawn=%d",
+            (ULONGLONG)g_current_image,
+            FV_MS_ARGS(elapsed_us),
+            (DWORD)result,
+            image_drawn ? 1 : 0);
+        if (SUCCEEDED(result) && image_drawn && g_trace_frame_pending) {
+            ULONGLONG frame_us = fv_trace_us_since(g_trace_frame_started);
+
+            g_trace_frame_pending = FALSE;
+            FvTrace_Printf(
+                L"frame-shown index=%I64u since-request-ms=" FV_MS,
+                (ULONGLONG)g_current_image,
+                FV_MS_ARGS(frame_us));
+            if (!g_trace_first_paint_done) {
+                g_trace_first_paint_done = TRUE;
+                FvTrace_Printf(L"first-paint index=%I64u", (ULONGLONG)g_current_image);
+            }
+        }
+    }
     if (result == D2DERR_RECREATE_TARGET) {
         fv_release_render_target();
     }
@@ -1777,6 +1967,10 @@ static int fv_application_main(void) {
     if (g_heap == NULL) {
         return -1;
     }
+    FvTrace_Initialize();
+    if (FV_TRACE_ENABLED()) {
+        FvTrace_Printf(L"process-start pid=%lu", GetCurrentProcessId());
+    }
     fv_string_list_init(&g_files);
     ZipArchive_Init(&g_zip);
     zip_initialized = TRUE;
@@ -1812,6 +2006,11 @@ static int fv_application_main(void) {
     if (!fv_choose_root(&root)) {
         exit_code = -1;
         goto cleanup;
+    }
+    if (FV_TRACE_ENABLED()) {
+        FvTrace_Printf(
+            L"start root=%s",
+            FvTrace_Tail(root, FV_TRACE_PATH_CHARS));
     }
     if (fv_split_zip_virtual_path(root, &zip_path, &inner_entry)) {
         loaded = fv_build_zip_file_list(zip_path, inner_entry, FALSE);
@@ -1915,6 +2114,10 @@ cleanup:
     if (ole_initialized) {
         OleUninitialize();
     }
+    if (FV_TRACE_ENABLED()) {
+        FvTrace_Printf(L"process-exit code=%d", exit_code);
+    }
+    FvTrace_Shutdown();
     return exit_code;
 }
 

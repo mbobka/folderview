@@ -38,6 +38,15 @@ fview <path>
 | `Esc` | Exit |
 | Left mouse drag | Pan the image |
 
+## Diagnostics
+
+Set `FOLDERVIEW_TRACE` to a file path to append a timing trace (UTF-8, one event per line, QPC time in milliseconds since start): ZIP open phases with `ReadFile` counts, entry reads, decoding, bitmap creation, `EndDraw`, and the moment each frame is shown. Without the variable tracing costs a single flag check.
+
+```powershell
+$env:FOLDERVIEW_TRACE = "$env:TEMP\folderview-trace.txt"
+fview photos.zip
+```
+
 ## Build with Docker
 
 FolderView is written in freestanding C and cross-compiled for windows-amd64 inside a **Linux** Docker container. The toolchain is `clang-cl` + `lld-link` + `llvm-rc`; Windows SDK headers and import libraries are fetched with [xwin](https://github.com/Jake-Shadle/xwin). The host machine only needs the source tree and Docker with BuildKit support.
@@ -45,6 +54,8 @@ FolderView is written in freestanding C and cross-compiled for windows-amd64 ins
 ```powershell
 .\build\Invoke-DockerBuild.ps1
 ```
+
+Before the Windows build, platform-independent C code (ZIP structure parsing from memory) is compiled natively in the container and checked by regression tests under UBSan (`FolderView\tests`); a failing test fails the build.
 
 The output is written to `out-win-amd64\` and includes `FolderView.exe`, license notices, a portable ZIP, and a SHA256 file. The required `inflate` sources from zlib are compiled in `Z_SOLO` mode with WinAPI heap callbacks, so no `zlib1.dll` is shipped. The portable ZIP includes the FolderView license and the zlib notice. The first build downloads the Windows SDK and toolchain, so it takes longer than later cached builds.
 
