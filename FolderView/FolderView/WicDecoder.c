@@ -2,10 +2,10 @@
 #define COBJMACROS
 
 #include "ImageDecoder.h"
+#include "ViewerPlan.h"
 
 #include <objbase.h>
 #include <objidl.h>
-#include <shlwapi.h>
 #include <wincodec.h>
 
 static IWICImagingFactory* g_wic_factory;
@@ -13,7 +13,17 @@ static BOOL g_com_reference_owned;
 
 static HRESULT decode_wic_decoder(
     IWICBitmapDecoder* decoder,
-    DecodedImage* out_image);
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats);
+
+static ULONGLONG decoder_now(void)
+{
+    LARGE_INTEGER now;
+
+    QueryPerformanceCounter(&now);
+    return (ULONGLONG)now.QuadPart;
+}
 
 static BOOL frame_supports_alpha(IWICBitmapFrameDecode* frame)
 {
@@ -150,13 +160,36 @@ void DecodedImage_Free(DecodedImage* image)
     image->height = 0;
     image->stride = 0;
     image->has_alpha = FALSE;
+    image->source_width = 0;
+    image->source_height = 0;
 }
 
 HRESULT ImageDecoder_DecodeFile(LPCWSTR path, DecodedImage* out_image)
 {
+    return ImageDecoder_DecodeFileEx(path, NULL, out_image, NULL);
+}
+
+HRESULT ImageDecoder_DecodeMemory(
+    const BYTE* data,
+    SIZE_T data_size,
+    DecodedImage* out_image)
+{
+    return ImageDecoder_DecodeMemoryEx(data, data_size, NULL, out_image, NULL);
+}
+
+HRESULT ImageDecoder_DecodeFileEx(
+    LPCWSTR path,
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats)
+{
     IWICBitmapDecoder* decoder = NULL;
+    ULONGLONG started = decoder_now();
     HRESULT hr;
 
+    if (stats != NULL) {
+        ZeroMemory(stats, sizeof(*stats));
+    }
     if (path == NULL || path[0] == L'\0' || out_image == NULL) {
         return E_INVALIDARG;
     }
@@ -174,115 +207,166 @@ HRESULT ImageDecoder_DecodeFile(LPCWSTR path, DecodedImage* out_image)
     if (FAILED(hr)) {
         return hr;
     }
+    if (stats != NULL) {
+        stats->open_ticks = decoder_now() - started;
+    }
 
-    hr = decode_wic_decoder(decoder, out_image);
+    hr = decode_wic_decoder(decoder, options, out_image, stats);
     IWICBitmapDecoder_Release(decoder);
     return hr;
 }
 
-HRESULT ImageDecoder_DecodeMemory(
+HRESULT ImageDecoder_DecodeMemoryEx(
     const BYTE* data,
     SIZE_T data_size,
-    DecodedImage* out_image)
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats)
 {
-    IStream* stream = NULL;
+    IWICStream* stream = NULL;
     IWICBitmapDecoder* decoder = NULL;
+    ULONGLONG started = decoder_now();
     HRESULT hr;
 
+    if (stats != NULL) {
+        ZeroMemory(stats, sizeof(*stats));
+    }
     if (data == NULL || data_size == 0 || out_image == NULL) {
         return E_INVALIDARG;
     }
-    if (data_size > (SIZE_T)(UINT)~(UINT)0) {
+    if (data_size > (SIZE_T)(DWORD)~(DWORD)0) {
         return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
     }
     if (g_wic_factory == NULL) {
         return CO_E_NOTINITIALIZED;
     }
 
-    stream = SHCreateMemStream(data, (UINT)data_size);
-    if (stream == NULL) {
-        return E_OUTOFMEMORY;
+    // IWICStream читает прямо из буфера вызывающего (SHCreateMemStream копировал
+    // весь файл). Буфер живёт до возврата: декодер и поток освобождаются здесь.
+    hr = IWICImagingFactory_CreateStream(g_wic_factory, &stream);
+    if (FAILED(hr)) {
+        return hr;
     }
-
-    hr = IWICImagingFactory_CreateDecoderFromStream(
-        g_wic_factory,
-        stream,
-        NULL,
-        WICDecodeMetadataCacheOnDemand,
-        &decoder);
+    hr = IWICStream_InitializeFromMemory(stream, (BYTE*)data, (DWORD)data_size);
     if (SUCCEEDED(hr)) {
-        hr = decode_wic_decoder(decoder, out_image);
+        hr = IWICImagingFactory_CreateDecoderFromStream(
+            g_wic_factory,
+            (IStream*)stream,
+            NULL,
+            WICDecodeMetadataCacheOnDemand,
+            &decoder);
+    }
+    if (SUCCEEDED(hr)) {
+        if (stats != NULL) {
+            stats->open_ticks = decoder_now() - started;
+        }
+        hr = decode_wic_decoder(decoder, options, out_image, stats);
         IWICBitmapDecoder_Release(decoder);
     }
 
-    IStream_Release(stream);
+    IWICStream_Release(stream);
     return hr;
 }
 
-static HRESULT decode_wic_decoder(
-    IWICBitmapDecoder* decoder,
-    DecodedImage* out_image)
+// Размер, до которого декодер кадра умеет масштабировать нативно
+// (IWICBitmapSourceTransform; у JPEG — DCT 1/2, 1/4, 1/8), не меньше цели и
+// меньше исходного. FALSE — масштаба нет или он бесполезен.
+static BOOL query_dct_size(
+    IWICBitmapFrameDecode* frame,
+    UINT source_width,
+    UINT source_height,
+    UINT target_width,
+    UINT target_height,
+    UINT* out_width,
+    UINT* out_height,
+    UINT* out_denominator)
 {
-    IWICBitmapFrameDecode* frame = NULL;
-    IWICFormatConverter* converter = NULL;
-    BYTE* pixels = NULL;
+    IWICBitmapSourceTransform* transform = NULL;
+    UINT denominator;
     UINT width;
     UINT height;
-    UINT stride;
-    SIZE_T pixels_size;
-    ULONGLONG required_size;
+    HRESULT hr;
+
+    denominator = FvPlan_ChooseDctDenominator(
+        source_width,
+        source_height,
+        target_width,
+        target_height);
+    if (denominator <= 1) {
+        return FALSE;
+    }
+    hr = IWICBitmapFrameDecode_QueryInterface(
+        frame,
+        &IID_IWICBitmapSourceTransform,
+        (void**)&transform);
+    if (FAILED(hr)) {
+        return FALSE;
+    }
+
+    width = FvPlan_DivideCeil(source_width, denominator);
+    height = FvPlan_DivideCeil(source_height, denominator);
+    hr = IWICBitmapSourceTransform_GetClosestSize(transform, &width, &height);
+    IWICBitmapSourceTransform_Release(transform);
+    if (FAILED(hr) ||
+        width < target_width || height < target_height ||
+        width == 0 || height == 0 ||
+        (width >= source_width && height >= source_height)) {
+        return FALSE;
+    }
+
+    *out_width = width;
+    *out_height = height;
+    *out_denominator = denominator;
+    return TRUE;
+}
+
+static HRESULT wrap_scaler(
+    IWICBitmapSource* source,
+    UINT width,
+    UINT height,
+    ImageDecoderInterpolation interpolation,
+    IWICBitmapSource** result)
+{
+    IWICBitmapScaler* scaler = NULL;
+    HRESULT hr;
+
+    *result = NULL;
+    hr = IWICImagingFactory_CreateBitmapScaler(g_wic_factory, &scaler);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = IWICBitmapScaler_Initialize(
+        scaler,
+        source,
+        width,
+        height,
+        (WICBitmapInterpolationMode)interpolation);
+    if (FAILED(hr)) {
+        IWICBitmapScaler_Release(scaler);
+        return hr;
+    }
+    *result = (IWICBitmapSource*)scaler;
+    return S_OK;
+}
+
+static HRESULT wrap_converter(IWICBitmapSource* source, IWICBitmapSource** result)
+{
+    IWICFormatConverter* converter = NULL;
     union {
         ULONGLONG bits;
         double value;
     } alpha_threshold;
-    BOOL has_alpha;
     HRESULT hr;
 
-    if (decoder == NULL || out_image == NULL) {
-        return E_INVALIDARG;
-    }
-
-    hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
-    if (FAILED(hr)) {
-        return hr;
-    }
-
-    hr = IWICBitmapFrameDecode_GetSize(frame, &width, &height);
-    if (FAILED(hr)) {
-        IWICBitmapFrameDecode_Release(frame);
-        return hr;
-    }
-    if (width == 0 || height == 0) {
-        IWICBitmapFrameDecode_Release(frame);
-        return WINCODEC_ERR_BADIMAGE;
-    }
-    if (width > ((UINT)~(UINT)0) / 4U) {
-        IWICBitmapFrameDecode_Release(frame);
-        return HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
-    }
-
-    stride = width * 4U;
-    required_size = (ULONGLONG)stride * (ULONGLONG)height;
-    if (required_size > (ULONGLONG)(UINT)~(UINT)0 ||
-        required_size > (ULONGLONG)(SIZE_T)~(SIZE_T)0) {
-        IWICBitmapFrameDecode_Release(frame);
-        return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
-    }
-    pixels_size = (SIZE_T)required_size;
-    has_alpha = frame_supports_alpha(frame);
+    *result = NULL;
     alpha_threshold.bits = 0;
-
-    hr = IWICImagingFactory_CreateFormatConverter(
-        g_wic_factory,
-        &converter);
+    hr = IWICImagingFactory_CreateFormatConverter(g_wic_factory, &converter);
     if (FAILED(hr)) {
-        IWICBitmapFrameDecode_Release(frame);
         return hr;
     }
-
     hr = IWICFormatConverter_Initialize(
         converter,
-        (IWICBitmapSource*)frame,
+        source,
         &GUID_WICPixelFormat32bppPBGRA,
         WICBitmapDitherTypeNone,
         NULL,
@@ -290,25 +374,254 @@ static HRESULT decode_wic_decoder(
         WICBitmapPaletteTypeCustom);
     if (FAILED(hr)) {
         IWICFormatConverter_Release(converter);
-        IWICBitmapFrameDecode_Release(frame);
+        return hr;
+    }
+    *result = (IWICBitmapSource*)converter;
+    return S_OK;
+}
+
+// Цепочка source -> [scaler] -> конвертер PBGRA -> CopyPixels в pixels.
+// С альфой конвертер идёт до scaler: масштабировать нужно premultiplied
+// пиксели, иначе на краях прозрачности появляется ореол.
+static HRESULT copy_scaled_pbgra(
+    IWICBitmapSource* source,
+    UINT target_width,
+    UINT target_height,
+    BOOL has_alpha,
+    ImageDecoderInterpolation interpolation,
+    UINT stride,
+    UINT pixels_size,
+    BYTE* pixels,
+    BOOL* scaled)
+{
+    IWICBitmapSource* first = NULL;
+    IWICBitmapSource* second = NULL;
+    UINT width = 0;
+    UINT height = 0;
+    BOOL needs_scale;
+    HRESULT hr;
+
+    *scaled = FALSE;
+    hr = IWICBitmapSource_GetSize(source, &width, &height);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    needs_scale = width != target_width || height != target_height;
+
+    if (!needs_scale) {
+        hr = wrap_converter(source, &first);
+    } else if (has_alpha) {
+        hr = wrap_converter(source, &first);
+        if (SUCCEEDED(hr)) {
+            hr = wrap_scaler(first, target_width, target_height, interpolation, &second);
+        }
+    } else {
+        hr = wrap_scaler(source, target_width, target_height, interpolation, &first);
+        if (SUCCEEDED(hr)) {
+            hr = wrap_converter(first, &second);
+        }
+    }
+
+    if (SUCCEEDED(hr)) {
+        IWICBitmapSource* last = second != NULL ? second : first;
+
+        hr = IWICBitmapSource_CopyPixels(last, NULL, stride, pixels_size, pixels);
+        *scaled = needs_scale;
+    }
+
+    if (second != NULL) {
+        IWICBitmapSource_Release(second);
+    }
+    if (first != NULL) {
+        IWICBitmapSource_Release(first);
+    }
+    return hr;
+}
+
+static HRESULT decode_wic_decoder(
+    IWICBitmapDecoder* decoder,
+    const ImageDecodeOptions* options,
+    DecodedImage* out_image,
+    ImageDecodeStats* stats)
+{
+    static const ImageDecodeOptions full_resolution = {0};
+    IWICBitmapFrameDecode* frame = NULL;
+    IWICBitmapSource* dct_source = NULL;
+    IWICBitmapSource* source;
+    BYTE* pixels = NULL;
+    UINT source_width;
+    UINT source_height;
+    UINT32 target_width;
+    UINT32 target_height;
+    UINT stride;
+    SIZE_T pixels_size;
+    ULONGLONG required_size;
+    ULONGLONG started;
+    ImageDecoderInterpolation interpolation;
+    UINT dct_width = 0;
+    UINT dct_height = 0;
+    UINT dct_denominator = 1;
+    BOOL has_alpha;
+    BOOL scaled = FALSE;
+    HRESULT hr;
+
+    if (decoder == NULL || out_image == NULL) {
+        return E_INVALIDARG;
+    }
+    if (options == NULL) {
+        options = &full_resolution;
+    }
+    interpolation = options->interpolation;
+    if ((int)interpolation < (int)IMAGE_DECODER_INTERPOLATION_NEAREST ||
+        (int)interpolation > (int)IMAGE_DECODER_INTERPOLATION_HIGH_QUALITY_CUBIC) {
+        interpolation = IMAGE_DECODER_DEFAULT_INTERPOLATION;
+    }
+
+    started = decoder_now();
+    hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (FAILED(hr)) {
         return hr;
     }
 
+    hr = IWICBitmapFrameDecode_GetSize(frame, &source_width, &source_height);
+    if (FAILED(hr)) {
+        IWICBitmapFrameDecode_Release(frame);
+        return hr;
+    }
+    if (source_width == 0 || source_height == 0) {
+        IWICBitmapFrameDecode_Release(frame);
+        return WINCODEC_ERR_BADIMAGE;
+    }
+    if (stats != NULL) {
+        stats->open_ticks += decoder_now() - started;
+        stats->source_width = source_width;
+        stats->source_height = source_height;
+        stats->dct_denominator = 1;
+    }
+
+    // Цель — вписать в рамку; уменьшение меньше двукратного (DCT его не
+    // достигает) не делается — см. FvPlan_DecodeTarget.
+    FvPlan_DecodeTarget(
+        source_width,
+        source_height,
+        options->box_width,
+        options->box_height,
+        options->max_dimension,
+        &target_width,
+        &target_height);
+    has_alpha = frame_supports_alpha(frame);
+
+    // Масштаб DCT только для непрозрачных кадров: JPEG альфы не имеет, а
+    // для остальных форматов декодер преобразование не поддерживает.
+    if ((target_width != source_width || target_height != source_height) &&
+        !has_alpha &&
+        !options->disable_source_transform &&
+        query_dct_size(
+            frame,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+            &dct_width,
+            &dct_height,
+            &dct_denominator)) {
+        // DCT-размер чуть больше цели — берём его без scaler: остаток
+        // уменьшения дёшево и без потерь качества делает D2D при отрисовке.
+        if (FvPlan_AcceptDctSize(
+                dct_width,
+                dct_height,
+                target_width,
+                target_height,
+                options->dct_slack_percent) &&
+            (options->max_dimension == 0 ||
+             (dct_width <= options->max_dimension && dct_height <= options->max_dimension))) {
+            target_width = dct_width;
+            target_height = dct_height;
+        }
+    }
+
+    if (target_width > ((UINT)~(UINT)0) / 4U) {
+        IWICBitmapFrameDecode_Release(frame);
+        return HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
+    }
+    stride = target_width * 4U;
+    required_size = (ULONGLONG)stride * (ULONGLONG)target_height;
+    if (required_size > (ULONGLONG)(UINT)~(UINT)0 ||
+        required_size > (ULONGLONG)(SIZE_T)~(SIZE_T)0) {
+        IWICBitmapFrameDecode_Release(frame);
+        return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+    }
+    pixels_size = (SIZE_T)required_size;
+
     pixels = (BYTE*)HeapAlloc(GetProcessHeap(), 0, pixels_size);
     if (pixels == NULL) {
-        IWICFormatConverter_Release(converter);
         IWICBitmapFrameDecode_Release(frame);
         return E_OUTOFMEMORY;
     }
 
-    hr = IWICFormatConverter_CopyPixels(
-        converter,
-        NULL,
+    started = decoder_now();
+    source = (IWICBitmapSource*)frame;
+    if (dct_denominator > 1) {
+        /*
+         * Запрос ровно нативного DCT-размера у IWICBitmapScaler WIC
+         * выполняет через IWICBitmapSourceTransform декодера — потоково, без
+         * промежуточного буфера кадра (замер: на 1,5–3,5 мс быстрее явного
+         * IWICBitmapSourceTransform::CopyPixels в промежуточный IWICBitmap).
+         * Интерполяция здесь не участвует.
+         */
+        if (SUCCEEDED(wrap_scaler(
+                source,
+                dct_width,
+                dct_height,
+                IMAGE_DECODER_INTERPOLATION_NEAREST,
+                &dct_source))) {
+            source = dct_source;
+            if (stats != NULL) {
+                stats->transform_width = dct_width;
+                stats->transform_height = dct_height;
+                stats->dct_denominator = dct_denominator;
+            }
+        }
+    }
+
+    hr = copy_scaled_pbgra(
+        source,
+        target_width,
+        target_height,
+        has_alpha,
+        interpolation,
         stride,
         (UINT)pixels_size,
-        pixels);
+        pixels,
+        &scaled);
+    if (FAILED(hr) && dct_source != NULL) {
+        // DCT-путь не сработал — повторяем от исходного кадра.
+        IWICBitmapSource_Release(dct_source);
+        dct_source = NULL;
+        if (stats != NULL) {
+            stats->transform_width = 0;
+            stats->transform_height = 0;
+            stats->dct_denominator = 1;
+        }
+        hr = copy_scaled_pbgra(
+            (IWICBitmapSource*)frame,
+            target_width,
+            target_height,
+            has_alpha,
+            interpolation,
+            stride,
+            (UINT)pixels_size,
+            pixels,
+            &scaled);
+    }
+    if (stats != NULL) {
+        stats->pixels_ticks = decoder_now() - started;
+        stats->scaled = scaled;
+    }
 
-    IWICFormatConverter_Release(converter);
+    if (dct_source != NULL) {
+        IWICBitmapSource_Release(dct_source);
+    }
     IWICBitmapFrameDecode_Release(frame);
 
     if (FAILED(hr)) {
@@ -319,9 +632,11 @@ static HRESULT decode_wic_decoder(
     DecodedImage_Free(out_image);
     out_image->pixels = pixels;
     out_image->pixels_size = pixels_size;
-    out_image->width = width;
-    out_image->height = height;
+    out_image->width = target_width;
+    out_image->height = target_height;
     out_image->stride = stride;
     out_image->has_alpha = has_alpha;
+    out_image->source_width = source_width;
+    out_image->source_height = source_height;
     return S_OK;
 }

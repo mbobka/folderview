@@ -16,6 +16,7 @@
 
 #include "ImageDecoder.h"
 #include "Trace.h"
+#include "ViewerPlan.h"
 #include "ZipArchive.h"
 
 /*
@@ -126,7 +127,7 @@ typedef struct FvD2DHwndRenderTargetVtbl {
     FvD2DUnusedMethod GetDpi;
     FvD2DUnusedMethod GetSize;
     FvD2DUnusedMethod GetPixelSize;
-    FvD2DUnusedMethod GetMaximumBitmapSize;
+    UINT32 (STDMETHODCALLTYPE *GetMaximumBitmapSize)(ID2D1HwndRenderTarget *self);
     FvD2DUnusedMethod IsSupported;
     D2D1_WINDOW_STATE (STDMETHODCALLTYPE *CheckWindowState)(ID2D1HwndRenderTarget *self);
     HRESULT (STDMETHODCALLTYPE *Resize)(
@@ -153,7 +154,13 @@ struct ID2D1Bitmap {
 #define FV_TARGET_VT(object) ((object)->lpVtbl)
 #define FV_UNKNOWN_VT(object) ((object)->lpVtbl)
 
+/*
+ * Кэш кадров ограничен и радиусом вокруг текущего кадра, и бюджетом в байтах
+ * (пиксели + D2D-битмапы, ViewerPlan.h); вытесняются самые дальние кадры.
+ */
 #define FV_CACHE_RADIUS ((SIZE_T)50)
+/* Максимальный размер D2D-битмапа до создания render target (типичный). */
+#define FV_DEFAULT_MAX_BITMAP_SIZE ((UINT32)16384)
 #define FV_MAX_ZIP_IMAGE_BYTES ((ULONGLONG)1024 * 1024 * 1024)
 
 typedef struct FvStringList {
@@ -168,13 +175,30 @@ typedef struct FvWideBuilder {
     SIZE_T capacity;
 } FvWideBuilder;
 
+/*
+ * Кадр в кэше: декодированные пиксели (обычно под размер монитора) и
+ * созданный по ним D2D-битмап. Битмап живёт рядом с кадром, чтобы возврат к
+ * уже показанному кадру не стоил повторной загрузки в GPU; освобождается при
+ * вытеснении кадра, передекодировании и пересоздании render target.
+ */
+typedef struct FvCacheEntry {
+    DecodedImage image;
+    ID2D1Bitmap *bitmap;
+    SIZE_T bitmap_bytes;
+} FvCacheEntry;
+
 static HANDLE g_heap;
 static ID2D1Factory *g_d2d_factory;
 static ID2D1HwndRenderTarget *g_render_target;
-static ID2D1Bitmap *g_d2d_bitmap;
-static SIZE_T g_d2d_bitmap_image = ~(SIZE_T)0;
+/* Предел стороны D2D-битмапа текущего render target. */
+static UINT32 g_max_bitmap_size = FV_DEFAULT_MAX_BITMAP_SIZE;
+/* Бюджет кэша кадров (пиксели + битмапы) и его часть под битмапы, байт. */
+static ULONGLONG g_cache_budget;
+static ULONGLONG g_bitmap_budget;
 static FvStringList g_files;
-static DecodedImage *g_cache;
+static FvCacheEntry *g_cache;
+/* Кадр, ленивое передекодирование которого не удалось (до смены кадра). */
+static SIZE_T g_upgrade_failed_image = ~(SIZE_T)0;
 static ZipArchive g_zip;
 static const ZipEntry **g_zip_entries;
 static BOOL g_zip_mode;
@@ -200,7 +224,8 @@ static void fv_previous_image(HWND window);
 static void fv_next_image(HWND window);
 static void fv_draw_image(HWND window);
 static void fv_update_window_title(HWND window);
-static void fv_release_d2d_bitmap(void);
+static void fv_release_entry_bitmap(FvCacheEntry *entry);
+static void fv_release_all_bitmaps(void);
 
 static BOOL fv_size_multiply(SIZE_T left, SIZE_T right, SIZE_T *result) {
     SIZE_T maximum = ~(SIZE_T)0;
@@ -693,6 +718,11 @@ static void fv_builder_dispose(FvWideBuilder *builder) {
     builder->capacity = 0;
 }
 
+static void fv_free_cache_entry(FvCacheEntry *entry) {
+    fv_release_entry_bitmap(entry);
+    DecodedImage_Free(&entry->image);
+}
+
 static void fv_free_cache(void) {
     SIZE_T index;
 
@@ -700,14 +730,13 @@ static void fv_free_cache(void) {
         return;
     }
     for (index = 0; index < g_files.count; ++index) {
-        DecodedImage_Free(&g_cache[index]);
+        fv_free_cache_entry(&g_cache[index]);
     }
     fv_heap_free(g_cache);
     g_cache = NULL;
 }
 
 static void fv_clear_files_and_cache(void) {
-    fv_release_d2d_bitmap();
     fv_free_cache();
     fv_string_list_clear(&g_files);
     fv_heap_free(g_zip_entries);
@@ -718,18 +747,18 @@ static void fv_clear_files_and_cache(void) {
     g_image_shift.y = 0;
 }
 
-static BOOL fv_allocate_cache_for_count(SIZE_T count, DecodedImage **cache) {
+static BOOL fv_allocate_cache_for_count(SIZE_T count, FvCacheEntry **cache) {
     SIZE_T bytes;
 
     *cache = NULL;
     if (count == 0) {
         return TRUE;
     }
-    if (!fv_size_multiply(count, sizeof(DecodedImage), &bytes)) {
+    if (!fv_size_multiply(count, sizeof(FvCacheEntry), &bytes)) {
         return FALSE;
     }
 
-    *cache = (DecodedImage *)fv_heap_allocate(bytes, TRUE);
+    *cache = (FvCacheEntry *)fv_heap_allocate(bytes, TRUE);
     return *cache != NULL;
 }
 
@@ -914,7 +943,7 @@ static BOOL fv_build_zip_file_list(
     BOOL reuse_open_zip;
     FvStringList temporary_files;
     const ZipEntry **temporary_zip_entries = NULL;
-    DecodedImage *temporary_cache = NULL;
+    FvCacheEntry *temporary_cache = NULL;
     SIZE_T temporary_current_image = 0;
     SIZE_T entry_count;
     SIZE_T byte_count;
@@ -1129,7 +1158,7 @@ static void fv_update_window_title(HWND window) {
     if (g_cache == NULL || g_current_image >= g_files.count) {
         return;
     }
-    image = &g_cache[g_current_image];
+    image = &g_cache[g_current_image].image;
     if (!DecodedImage_IsValid(image)) {
         return;
     }
@@ -1142,10 +1171,11 @@ static void fv_update_window_title(HWND window) {
         fv_builder_append(&title, L" -> ");
     }
     fv_builder_append(&title, g_files.items[g_current_image]);
+    /* Размер исходного кадра: декодированный буфер может быть меньше. */
     fv_builder_append(&title, L" [");
-    fv_builder_append_u64(&title, image->width);
+    fv_builder_append_u64(&title, image->source_width);
     fv_builder_append(&title, L"x");
-    fv_builder_append_u64(&title, image->height);
+    fv_builder_append_u64(&title, image->source_height);
     fv_builder_append(&title, image->has_alpha ? L" RGBA] " : L" RGB] ");
     percentage = (ULONGLONG)(g_scale * 100.0f + 0.5f);
     fv_builder_append_u64(&title, percentage);
@@ -1157,23 +1187,189 @@ static void fv_update_window_title(HWND window) {
     fv_builder_dispose(&title);
 }
 
-static void fv_trim_cache(void) {
+static void fv_release_entry_bitmap(FvCacheEntry *entry) {
+    if (entry->bitmap != NULL) {
+        FV_UNKNOWN_VT(entry->bitmap)->Release(entry->bitmap);
+        entry->bitmap = NULL;
+    }
+    entry->bitmap_bytes = 0;
+}
+
+/* Все битмапы принадлежат render target: при его пересоздании они недействительны. */
+static void fv_release_all_bitmaps(void) {
     SIZE_T index;
 
+    if (g_cache == NULL) {
+        return;
+    }
     for (index = 0; index < g_files.count; ++index) {
-        SIZE_T distance = index < g_current_image
-            ? g_current_image - index
-            : index - g_current_image;
-        if (distance > FV_CACHE_RADIUS) {
-            DecodedImage_Free(&g_cache[index]);
-        }
+        fv_release_entry_bitmap(&g_cache[index]);
     }
 }
 
-static HRESULT fv_decode_current_image(void) {
-    HRESULT result;
+/*
+ * Вытеснение кадров: сначала битмапы сверх своей части бюджета (кадр остаётся
+ * в памяти и при возврате лишь заново загружается в GPU), затем кадры целиком
+ * сверх общего бюджета и дальше FV_CACHE_RADIUS. Порядок — от самых дальних
+ * от текущего (FvPlan_SelectEvictions); текущий кадр не вытесняется.
+ */
+static void fv_trim_cache(void) {
+    ULONGLONG *bytes = NULL;
+    SIZE_T *evicted = NULL;
+    SIZE_T count = g_files.count;
+    SIZE_T evicted_bitmaps;
+    SIZE_T evicted_frames;
+    SIZE_T array_bytes;
+    SIZE_T index;
+    uint64_t remaining = 0;
 
+    if (g_cache == NULL || count == 0 || g_current_image >= count) {
+        return;
+    }
+    if (!fv_size_multiply(count, sizeof(*bytes), &array_bytes)) {
+        return;
+    }
+    bytes = (ULONGLONG *)fv_heap_allocate(array_bytes, FALSE);
+    if (!fv_size_multiply(count, sizeof(*evicted), &array_bytes)) {
+        fv_heap_free(bytes);
+        return;
+    }
+    evicted = (SIZE_T *)fv_heap_allocate(array_bytes, FALSE);
+    if (bytes == NULL || evicted == NULL) {
+        fv_heap_free(bytes);
+        fv_heap_free(evicted);
+        return;
+    }
+
+    for (index = 0; index < count; ++index) {
+        bytes[index] = g_cache[index].bitmap_bytes;
+    }
+    evicted_bitmaps = FvPlan_SelectEvictions(
+        (const uint64_t *)bytes,
+        count,
+        g_current_image,
+        FV_CACHE_RADIUS,
+        g_bitmap_budget,
+        evicted,
+        count,
+        &remaining);
+    for (index = 0; index < evicted_bitmaps; ++index) {
+        fv_release_entry_bitmap(&g_cache[evicted[index]]);
+    }
+
+    for (index = 0; index < count; ++index) {
+        bytes[index] = (ULONGLONG)g_cache[index].image.pixels_size +
+            (ULONGLONG)g_cache[index].bitmap_bytes;
+    }
+    evicted_frames = FvPlan_SelectEvictions(
+        (const uint64_t *)bytes,
+        count,
+        g_current_image,
+        FV_CACHE_RADIUS,
+        g_cache_budget,
+        evicted,
+        count,
+        &remaining);
+    for (index = 0; index < evicted_frames; ++index) {
+        fv_free_cache_entry(&g_cache[evicted[index]]);
+    }
+
+    if (FV_TRACE_ENABLED()) {
+        ULONGLONG frames = 0;
+        ULONGLONG bitmaps = 0;
+        ULONGLONG bitmap_bytes = 0;
+
+        for (index = 0; index < count; ++index) {
+            if (DecodedImage_IsValid(&g_cache[index].image)) {
+                ++frames;
+            }
+            if (g_cache[index].bitmap != NULL) {
+                ++bitmaps;
+                bitmap_bytes += g_cache[index].bitmap_bytes;
+            }
+        }
+        FvTrace_Printf(
+            L"cache frames=%I64u bytes=%I64u bitmaps=%I64u bitmap_bytes=%I64u "
+            L"evicted_frames=%I64u evicted_bitmaps=%I64u budget=%I64u bitmap_budget=%I64u",
+            frames,
+            (ULONGLONG)remaining,
+            bitmaps,
+            bitmap_bytes,
+            (ULONGLONG)evicted_frames,
+            (ULONGLONG)evicted_bitmaps,
+            g_cache_budget,
+            g_bitmap_budget);
+    }
+
+    fv_heap_free(bytes);
+    fv_heap_free(evicted);
+}
+
+/*
+ * Рамка декодирования нового кадра. В развёрнутом окне масштаб «вписать»
+ * не больше вписывания в монитор, поэтому кадр декодируется под пиксельный
+ * размер монитора окна: ресайз окна в его пределах передекода не требует. В
+ * обычном окне вьювер показывает кадр 1:1 — нужна полная рамка (0x0).
+ */
+static void fv_decode_box(HWND window, UINT *box_width, UINT *box_height) {
+    WINDOWPLACEMENT placement;
+    MONITORINFO monitor_info;
+    HMONITOR monitor;
+
+    *box_width = 0;
+    *box_height = 0;
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(window, &placement) || placement.showCmd != SW_MAXIMIZE) {
+        return;
+    }
+    monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (monitor == NULL || !GetMonitorInfoW(monitor, &monitor_info)) {
+        return;
+    }
+    if (monitor_info.rcMonitor.right > monitor_info.rcMonitor.left &&
+        monitor_info.rcMonitor.bottom > monitor_info.rcMonitor.top) {
+        *box_width = (UINT)(monitor_info.rcMonitor.right - monitor_info.rcMonitor.left);
+        *box_height = (UINT)(monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top);
+    }
+}
+
+/* Пиксели экрана под сторону кадра при масштабе g_scale (с округлением вверх). */
+static UINT fv_display_extent(UINT source_extent) {
+    FLOAT value = (FLOAT)source_extent * g_scale;
+
+    if (value <= 0.0f) {
+        return 0;
+    }
+    if (value >= 4294967040.0f) {
+        return 0xFFFFFFFFU;
+    }
+    return (UINT)value + ((FLOAT)(UINT)value < value ? 1U : 0U);
+}
+
+/*
+ * Декодирует кадр index под рамку box (0x0 — полное разрешение) с пределом
+ * стороны g_max_bitmap_size. Новый кадр заменяет прежний (и его битмап)
+ * только при успехе: неудачное передекодирование оставляет то, что было.
+ */
+static HRESULT fv_decode_image(SIZE_T index, UINT box_width, UINT box_height, const WCHAR *reason) {
+    DecodedImage decoded;
+    ImageDecodeOptions options;
+    ImageDecodeStats stats;
+    HRESULT result;
     ULONGLONG trace_started;
+
+    if (g_cache == NULL || index >= g_files.count) {
+        return E_FAIL;
+    }
+    ZeroMemory(&decoded, sizeof(decoded));
+    ZeroMemory(&stats, sizeof(stats));
+    ZeroMemory(&options, sizeof(options));
+    options.box_width = box_width;
+    options.box_height = box_height;
+    options.max_dimension = g_max_bitmap_size;
+    options.interpolation = IMAGE_DECODER_DEFAULT_INTERPOLATION;
+    options.dct_slack_percent = IMAGE_DECODER_DEFAULT_DCT_SLACK_PERCENT;
 
     if (g_zip_mode) {
         BYTE *data = NULL;
@@ -1181,8 +1377,7 @@ static HRESULT fv_decode_current_image(void) {
         ZipIoStats io_before;
         BOOL extracted;
 
-        if (g_zip_entries == NULL ||
-            g_current_image >= g_files.count) {
+        if (g_zip_entries == NULL) {
             return E_FAIL;
         }
         if (FV_TRACE_ENABLED()) {
@@ -1191,7 +1386,7 @@ static HRESULT fv_decode_current_image(void) {
         trace_started = FV_TRACE_NOW();
         extracted = ZipArchive_ExtractEntry(
             &g_zip,
-            g_zip_entries[g_current_image],
+            g_zip_entries[index],
             FV_MAX_ZIP_IMAGE_BYTES,
             &data,
             &size);
@@ -1204,11 +1399,11 @@ static HRESULT fv_decode_current_image(void) {
             FvTrace_Printf(
                 L"entry-read index=%I64u ms=" FV_MS
                 L" bytes=%I64u compressed=%I64u method=%u reads=%I64u read_bytes=%I64u error=%lu",
-                (ULONGLONG)g_current_image,
+                (ULONGLONG)index,
                 FV_MS_ARGS(elapsed_us),
                 (ULONGLONG)size,
-                g_zip_entries[g_current_image]->compressed_size,
-                (UINT)g_zip_entries[g_current_image]->compression_method,
+                g_zip_entries[index]->compressed_size,
+                (UINT)g_zip_entries[index]->compression_method,
                 io_after.read_calls - io_before.read_calls,
                 io_after.read_bytes - io_before.read_bytes,
                 error);
@@ -1216,29 +1411,94 @@ static HRESULT fv_decode_current_image(void) {
         if (!extracted) {
             return E_FAIL;
         }
+        /* Буфер записи живёт до возврата: WIC читает его без копии. */
         trace_started = FV_TRACE_NOW();
-        result = ImageDecoder_DecodeMemory(data, size, &g_cache[g_current_image]);
+        result = ImageDecoder_DecodeMemoryEx(data, size, &options, &decoded, &stats);
         ZipArchive_FreeBuffer(data);
     } else {
         trace_started = FV_TRACE_NOW();
-        result = ImageDecoder_DecodeFile(
-            g_files.items[g_current_image],
-            &g_cache[g_current_image]);
+        result = ImageDecoder_DecodeFileEx(g_files.items[index], &options, &decoded, &stats);
     }
 
     if (FV_TRACE_ENABLED()) {
         ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
-        const DecodedImage *image = &g_cache[g_current_image];
+        ULONGLONG open_us = FvTrace_TicksToMicroseconds(stats.open_ticks);
+        ULONGLONG pixels_us = FvTrace_TicksToMicroseconds(stats.pixels_ticks);
 
         FvTrace_Printf(
-            L"decode index=%I64u ms=" FV_MS L" hr=0x%08lX width=%u height=%u",
-            (ULONGLONG)g_current_image,
+            L"decode index=%I64u ms=" FV_MS L" hr=0x%08lX reason=%s width=%u height=%u "
+            L"src_width=%u src_height=%u box=%ux%u max=%u dct=1/%u dct_size=%ux%u scaled=%d "
+            L"bytes=%I64u open_ms=" FV_MS L" pixels_ms=" FV_MS,
+            (ULONGLONG)index,
             FV_MS_ARGS(elapsed_us),
             (DWORD)result,
-            SUCCEEDED(result) ? image->width : 0U,
-            SUCCEEDED(result) ? image->height : 0U);
+            reason,
+            SUCCEEDED(result) ? decoded.width : 0U,
+            SUCCEEDED(result) ? decoded.height : 0U,
+            stats.source_width,
+            stats.source_height,
+            box_width,
+            box_height,
+            (UINT)g_max_bitmap_size,
+            stats.dct_denominator,
+            stats.transform_width,
+            stats.transform_height,
+            stats.scaled ? 1 : 0,
+            SUCCEEDED(result) ? (ULONGLONG)decoded.pixels_size : 0ULL,
+            FV_MS_ARGS(open_us),
+            FV_MS_ARGS(pixels_us));
     }
-    return result;
+    if (FAILED(result) || !DecodedImage_IsValid(&decoded)) {
+        DecodedImage_Free(&decoded);
+        return FAILED(result) ? result : E_FAIL;
+    }
+
+    fv_free_cache_entry(&g_cache[index]);
+    g_cache[index].image = decoded;
+    return S_OK;
+}
+
+/*
+ * Ленивое передекодирование текущего кадра: если при текущем масштабе
+ * (зум, 1:1, обычное окно) кадр на экране больше декодированного — вплоть до
+ * полного разрешения; если декодированный кадр больше предела D2D-битмапа
+ * (например, после пересоздания render target) — вниз до предела. Соседи в
+ * кэше остаются уменьшенными.
+ */
+static void fv_ensure_current_resolution(void) {
+    const DecodedImage *image;
+    UINT display_width;
+    UINT display_height;
+
+    if (g_cache == NULL || g_current_image >= g_files.count) {
+        return;
+    }
+    image = &g_cache[g_current_image].image;
+    if (!DecodedImage_IsValid(image)) {
+        return;
+    }
+    display_width = fv_display_extent(image->source_width);
+    display_height = fv_display_extent(image->source_height);
+    if (!FvPlan_NeedsRedecode(
+            image->source_width,
+            image->source_height,
+            image->width,
+            image->height,
+            display_width,
+            display_height,
+            g_max_bitmap_size)) {
+        return;
+    }
+    if (g_upgrade_failed_image == g_current_image) {
+        /* Неудачу не повторяем на каждой перерисовке (панорама): до смены кадра. */
+        return;
+    }
+    /* Показ больше половины кадра даёт полное разрешение (FvPlan_DecodeTarget). */
+    if (SUCCEEDED(fv_decode_image(g_current_image, display_width, display_height, L"upgrade"))) {
+        fv_trim_cache();
+    } else {
+        g_upgrade_failed_image = g_current_image;
+    }
 }
 
 static void fv_set_current_image(HWND window, BOOL repaint) {
@@ -1252,28 +1512,35 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     g_has_image_shift = FALSE;
     g_image_shift.x = 0;
     g_image_shift.y = 0;
-    fv_release_d2d_bitmap();
-    image = &g_cache[g_current_image];
+    g_upgrade_failed_image = ~(SIZE_T)0;
+    image = &g_cache[g_current_image].image;
     if (FV_TRACE_ENABLED()) {
         g_trace_frame_started = FvTrace_Now();
         g_trace_frame_pending = TRUE;
         FvTrace_Printf(
-            L"frame-request index=%I64u cached=%d",
+            L"frame-request index=%I64u cached=%d bitmap=%d",
             (ULONGLONG)g_current_image,
-            DecodedImage_IsValid(image) ? 1 : 0);
+            DecodedImage_IsValid(image) ? 1 : 0,
+            g_cache[g_current_image].bitmap != NULL ? 1 : 0);
     }
     if (!DecodedImage_IsValid(image)) {
-        if (FAILED(fv_decode_current_image()) || !DecodedImage_IsValid(image)) {
+        UINT box_width;
+        UINT box_height;
+
+        fv_decode_box(window, &box_width, &box_height);
+        if (FAILED(fv_decode_image(g_current_image, box_width, box_height, L"new")) ||
+            !DecodedImage_IsValid(image)) {
             MessageBoxW(window, L"Не удалось загрузить изображение", L"Ошибка", MB_OK | MB_ICONERROR);
             if (repaint) {
                 InvalidateRect(window, NULL, FALSE);
             }
             return;
         }
-        fv_trim_cache();
     }
+    fv_trim_cache();
 
-    g_scale = fv_calculate_scale(window, image->width, image->height);
+    /* Масштаб, заголовок и размер окна — по исходному размеру кадра. */
+    g_scale = fv_calculate_scale(window, image->source_width, image->source_height);
     fv_update_window_title(window);
 
     placement.length = sizeof(placement);
@@ -1282,8 +1549,8 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
 
         rectangle.left = 0;
         rectangle.top = 0;
-        rectangle.right = (LONG)image->width;
-        rectangle.bottom = (LONG)image->height;
+        rectangle.right = (LONG)image->source_width;
+        rectangle.bottom = (LONG)image->source_height;
         AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(
             window,
@@ -1300,16 +1567,9 @@ static void fv_set_current_image(HWND window, BOOL repaint) {
     }
 }
 
-static void fv_release_d2d_bitmap(void) {
-    if (g_d2d_bitmap != NULL) {
-        FV_UNKNOWN_VT(g_d2d_bitmap)->Release(g_d2d_bitmap);
-        g_d2d_bitmap = NULL;
-    }
-    g_d2d_bitmap_image = ~(SIZE_T)0;
-}
-
 static void fv_release_render_target(void) {
-    fv_release_d2d_bitmap();
+    /* D2DERR_RECREATE_TARGET и выход: все битмапы кэша недействительны. */
+    fv_release_all_bitmaps();
     if (g_render_target != NULL) {
         FV_TARGET_VT(g_render_target)->Release(g_render_target);
         g_render_target = NULL;
@@ -1361,6 +1621,18 @@ static HRESULT fv_create_render_target(HWND window) {
         OutputDebugStringW(
             L"GPU render target creation failed, falling back to software rendering.\n");
     }
+    if (SUCCEEDED(result) && g_render_target != NULL) {
+        UINT32 maximum = FV_TARGET_VT(g_render_target)->GetMaximumBitmapSize(g_render_target);
+
+        /* Кадры больше предела не рисуются: декодируем их под предел. */
+        g_max_bitmap_size = maximum != 0 ? maximum : FV_DEFAULT_MAX_BITMAP_SIZE;
+        if (FV_TRACE_ENABLED()) {
+            FvTrace_Printf(
+                L"render-target type=%s max_bitmap=%u",
+                properties.type == D2D1_RENDER_TARGET_TYPE_HARDWARE ? L"hardware" : L"default",
+                (UINT)g_max_bitmap_size);
+        }
+    }
     return result;
 }
 
@@ -1406,31 +1678,44 @@ static void fv_draw_image(HWND window) {
         return;
     }
 
+    fv_ensure_current_resolution();
     if (g_cache != NULL && g_current_image < g_files.count &&
-        DecodedImage_IsValid(&g_cache[g_current_image])) {
-        image = &g_cache[g_current_image];
-        if (g_d2d_bitmap == NULL || g_d2d_bitmap_image != g_current_image) {
+        DecodedImage_IsValid(&g_cache[g_current_image].image)) {
+        FvCacheEntry *entry = &g_cache[g_current_image];
+
+        image = &entry->image;
+        if (entry->bitmap == NULL) {
             ULONGLONG trace_started;
 
-            fv_release_d2d_bitmap();
             trace_started = FV_TRACE_NOW();
-            g_d2d_bitmap = fv_create_d2d_bitmap(image);
+            entry->bitmap = fv_create_d2d_bitmap(image);
+            entry->bitmap_bytes = entry->bitmap != NULL
+                ? (SIZE_T)image->width * (SIZE_T)image->height * 4U
+                : 0;
             if (FV_TRACE_ENABLED()) {
                 ULONGLONG elapsed_us = fv_trace_us_since(trace_started);
 
                 FvTrace_Printf(
-                    L"create-bitmap index=%I64u ms=" FV_MS L" ok=%d width=%u height=%u",
+                    L"create-bitmap index=%I64u ms=" FV_MS L" ok=%d width=%u height=%u bytes=%I64u",
                     (ULONGLONG)g_current_image,
                     FV_MS_ARGS(elapsed_us),
-                    g_d2d_bitmap != NULL ? 1 : 0,
+                    entry->bitmap != NULL ? 1 : 0,
                     image->width,
-                    image->height);
+                    image->height,
+                    (ULONGLONG)entry->bitmap_bytes);
             }
-            if (g_d2d_bitmap != NULL) {
-                g_d2d_bitmap_image = g_current_image;
+            if (entry->bitmap != NULL) {
+                fv_trim_cache();
             }
+        } else if (FV_TRACE_ENABLED() && g_trace_frame_pending) {
+            /* Только на первой отрисовке кадра: панорама перерисовывает часто. */
+            FvTrace_Printf(
+                L"bitmap-cached index=%I64u width=%u height=%u",
+                (ULONGLONG)g_current_image,
+                image->width,
+                image->height);
         }
-        bitmap = g_d2d_bitmap;
+        bitmap = entry->bitmap;
     }
 
     background.r = 0.66f;
@@ -1447,8 +1732,12 @@ static void fv_draw_image(HWND window) {
         if (GetClientRect(window, &client)) {
             FLOAT client_width = (FLOAT)(client.right - client.left);
             FLOAT client_height = (FLOAT)(client.bottom - client.top);
-            FLOAT scaled_width = (FLOAT)image->width * g_scale;
-            FLOAT scaled_height = (FLOAT)image->height * g_scale;
+            /*
+             * Геометрия — по исходному размеру кадра: декодированный битмап
+             * (под экран) растягивается D2D на тот же прямоугольник.
+             */
+            FLOAT scaled_width = (FLOAT)image->source_width * g_scale;
+            FLOAT scaled_height = (FLOAT)image->source_height * g_scale;
             FLOAT x = (client_width - scaled_width) / 2.0f;
             FLOAT y = (client_height - scaled_height) / 2.0f;
             D2D1_RECT_F destination;
@@ -1548,13 +1837,14 @@ static void fv_toggle_actual_size(HWND window) {
     const DecodedImage *image;
 
     if (g_cache == NULL || g_current_image >= g_files.count ||
-        !DecodedImage_IsValid(&g_cache[g_current_image])) {
+        !DecodedImage_IsValid(&g_cache[g_current_image].image)) {
         return;
     }
-    image = &g_cache[g_current_image];
+    image = &g_cache[g_current_image].image;
 
+    /* 1:1 — относительно исходного кадра; нужное разрешение догрузит отрисовка. */
     if (fv_float_almost_equal(g_scale, 1.0f)) {
-        FLOAT fitted = fv_calculate_scale(window, image->width, image->height);
+        FLOAT fitted = fv_calculate_scale(window, image->source_width, image->source_height);
         if (fv_float_almost_equal(fitted, 1.0f)) {
             return;
         }
@@ -1833,17 +2123,17 @@ static LRESULT CALLBACK FvWindowProc(
         if ((wparam & MK_LBUTTON) != 0 &&
             g_cache != NULL &&
             g_current_image < g_files.count &&
-            DecodedImage_IsValid(&g_cache[g_current_image])) {
-            const DecodedImage *image = &g_cache[g_current_image];
+            DecodedImage_IsValid(&g_cache[g_current_image].image)) {
+            const DecodedImage *image = &g_cache[g_current_image].image;
             RECT client;
 
             if (GetClientRect(window, &client)) {
                 POINTS current = MAKEPOINTS(lparam);
                 LONG limit_x = fv_pan_limit(
-                    (FLOAT)image->width * g_scale,
+                    (FLOAT)image->source_width * g_scale,
                     client.right - client.left);
                 LONG limit_y = fv_pan_limit(
-                    (FLOAT)image->height * g_scale,
+                    (FLOAT)image->source_height * g_scale,
                     client.bottom - client.top);
                 LONG old_x = g_image_shift.x;
                 LONG old_y = g_image_shift.y;
@@ -1970,6 +2260,26 @@ static int fv_application_main(void) {
     FvTrace_Initialize();
     if (FV_TRACE_ENABLED()) {
         FvTrace_Printf(L"process-start pid=%lu", GetCurrentProcessId());
+    }
+    {
+        MEMORYSTATUSEX memory_status;
+        ULONGLONG physical = 0;
+
+        /* Бюджет кэша кадров — от объёма физической памяти (ViewerPlan.h). */
+        memory_status.dwLength = sizeof(memory_status);
+        if (GlobalMemoryStatusEx(&memory_status)) {
+            physical = memory_status.ullTotalPhys;
+        }
+        g_cache_budget = FvPlan_CacheBudget(physical);
+        g_bitmap_budget = FvPlan_BitmapBudget(g_cache_budget);
+        if (FV_TRACE_ENABLED()) {
+            FvTrace_Printf(
+                L"cache-budget bytes=%I64u bitmap_bytes=%I64u physical=%I64u radius=%I64u",
+                g_cache_budget,
+                g_bitmap_budget,
+                physical,
+                (ULONGLONG)FV_CACHE_RADIUS);
+        }
     }
     fv_string_list_init(&g_files);
     ZipArchive_Init(&g_zip);
